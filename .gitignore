@@ -1,0 +1,9 @@
+.env
+betvenv/
+__pycache__/
+*.pyc
+.betbot_config.json
+.betbot.pid
+.betbot_announced.json
+betbot.log
+*.log
