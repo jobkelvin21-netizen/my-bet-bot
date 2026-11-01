@@ -1,41 +1,28 @@
 #!/usr/bin/env python3
 """
-main.py — everything in ONE file.
+betbot.py — everything in ONE file.
 
-    python3 main.py          start (asks SportyBet phone / password / balance, then
-                             detaches to the background — you can close the terminal)
-    python3 main.py stop     stop the background bot
-    python3 main.py status   is it running?
-    python3 main.py fg       run in the foreground (debugging)
+    python3 betbot.py          start (asks SportyBet phone / password / balance, then
+                               detaches to the background — you can close the terminal)
+    python3 betbot.py stop     stop the background bot
+    python3 betbot.py status   is it running?
+    python3 betbot.py fg       run in the foreground (debugging)
 
 Telegram commands: /startbot /stopbot /slow /clear /switch /login /balance
-                   /matches /status /raw /shutdown
+                   /matches /status /pitch /raw /shutdown
 
 Lock a game:   /slow
-               SportyBet- <match url>
-               Bet365- <FI from the list>
-               Home- <home team>        (optional but recommended: safety check)
+               SportyBet- <SportyBet match url>
+               Bet365URL- <bet365 match link>   (the GOAL SIGNAL - opened directly)
+               Home- <home team>                (bet365 spelling; optional but recommended)
                Away- <away team>
+               Bet365- <FI>                     (ONLY if the match is not found by team names)
 
-bet365 Chrome runs as `botuser` (uid-scoped VPN). The SportyBet headless DOM
-browser runs in-process on the workspace IP.
-
-HOW A BET IS SENT (same as the standalone bet.py that works):
-  every order opens its OWN brand-new HTTPS connection, opens its OWN encryption
-  channel on it and sends the order straight away. No pooled / pre-opened /
-  re-used connection or channel is ever used for an order.
-  The rebet is the SAME request as the first bet. It is only sent after the first
-  bet has been ANSWERED, plus REBET_GAP seconds, so the server never sees two
-  orders in flight at once (that was the 19004 "already being processed" error).
-
-HOW THE PRICE IS READ: the SportyBet page pushes every odds change into the bot the
-moment it happens (MutationObserver -> Playwright binding), a 0.1 s poll is only the
-safety net. At goal time the price is a dictionary lookup (microseconds), then the bet
-is dispatched immediately. The probability sent with the bet is the one saved when the
-market was armed — nothing is fetched from the REST API at goal time.
-
-Keep-alive is built in: a supervisor process restarts the bot if it ever crashes
-and gives it back the login, balance, running state and the locked slow game.
+GOAL SIGNAL : the bet365 match page - the pitch marker OR the ticker line, whichever lands first, ONE per goal.
+              Goals that were already played when the page opened are history and never fire.
+SCORE FEED  : the bet365 live list (SS). It only CASHES OUT when a score goes down (and keeps the goal count right).
+HOW A BET IS SENT: every order opens its OWN brand-new HTTPS connection and encryption channel and is sent
+straight away. The rebet is the SAME request, sent only after the first bet was ANSWERED plus REBET_GAP.
 """
 from __future__ import annotations
 
@@ -83,8 +70,6 @@ CONFIG_FILE = Path.home() / ".betbot_config.json"
 PID_FILE = Path.home() / ".betbot.pid"
 LOG_FILE = Path.home() / "betbot.log"
 
-# ---- Telegram login pack: paste your NEW bot token between the quotes. If you leave it
-# ---- empty the bot asks once on first run and remembers it in ~/.betbot_config.json
 PASTE_TG_TOKEN = ""
 PASTE_TG_CHAT = "7377233973"
 
@@ -102,7 +87,6 @@ _CFG = _saved_cfg()
 
 
 class Config:
-    # Telegram login pack: env var, else ~/.betbot_config.json, else the values pasted above
     TELEGRAM_BOT_TOKEN = os.getenv("TG_TOKEN") or _CFG.get("token") or PASTE_TG_TOKEN
     TELEGRAM_CHAT_ID = os.getenv("TG_CHAT") or _CFG.get("chat_id") or PASTE_TG_CHAT
     MAX_PROFIT_PER_BET = min(float(os.getenv("MAX_PROFIT", str(HARD_CAP))), HARD_CAP)
@@ -119,8 +103,21 @@ class Config:
     PAGE_TIMEOUT = float(os.getenv("PAGE_TIMEOUT", "0.25"))    # max wait for ONE page read when the cache is empty
     FEED_WAIT = float(os.getenv("FEED_WAIT", "20"))        # wait for FI in feed
     API_TIMEOUT = float(os.getenv("API_TIMEOUT", "30"))    # SportyBet arm timeout
-    FAST = os.getenv("FAST", "0") in ("1", "true", "yes")  # bet 1 on a channel opened ahead (OFF until /warmtest passes)
-    WARM_TTL = float(os.getenv("WARM_TTL", "6"))           # a warm channel is replaced after this many seconds
+    PITCH_QUIET_SECS = float(os.getenv("PITCH_QUIET_SECS", "1.5"))       # the first seconds of the match records = history
+    PITCH_DEBOUNCE = float(os.getenv("PITCH_DEBOUNCE", "12"))            # the other source's signal for the SAME goal is ignored this long
+    PITCH_FRESH_MINUTES = float(os.getenv("PITCH_FRESH_MINUTES", "5"))   # a goal older than this many match minutes is history
+
+    REBET_GAP = float(os.getenv("REBET_GAP", "0.25"))          # pause after bet 1 was ANSWERED, before the rebet (0.25 s at most)
+    HISTORY_SECS = float(os.getenv("HISTORY_SECS", "6"))       # after every (re)connect of the match page the feed only LEARNS
+    SS_AHEAD_SECS = float(os.getenv("SS_AHEAD_SECS", "15"))    # SS counted a goal this recently and the pitch record comes now = still live
+    BALANCE_POLL = float(os.getenv("BALANCE_POLL", "5"))       # real SportyBet balance, read in the background
+    CASHOUT_POLL = float(os.getenv("CASHOUT_POLL", "1.0"))     # while waiting for the market to open again
+    CASHOUT_MAX_SECS = float(os.getenv("CASHOUT_MAX_SECS", "900"))
+    MISSED_GOAL_SECS = float(os.getenv("MISSED_GOAL_SECS", "20"))
+    CONFIRM_SECS = float(os.getenv("CONFIRM_SECS", "40"))
+
+    FT_SILENCE_SECS = float(os.getenv("FT_SILENCE_SECS", "120"))     # API silent this long after minute 85 = full time
+    FT_NOMARKET_SECS = float(os.getenv("FT_NOMARKET_SECS", "180"))   # no open next-goal market this long after minute 85 = full time
 
 
 logger.remove()
@@ -132,6 +129,13 @@ def _ord(n: int) -> str:
     if 10 <= n % 100 <= 20:
         return f"{n}th"
     return f"{n}{ {1:'st',2:'nd',3:'rd'}.get(n % 10,'th') }"
+
+
+def _wat(ts: Optional[float]) -> str:
+    """Nigeria time (WAT = UTC+1, no daylight saving) with milliseconds."""
+    from datetime import datetime, timedelta, timezone
+    t = datetime.fromtimestamp(float(ts or time.time()), timezone(timedelta(hours=1)))
+    return t.strftime("%H:%M:%S.") + f"{t.microsecond // 1000:03d} WAT"
 
 
 # =====================================================================
@@ -225,7 +229,7 @@ def _brief(r: dict) -> str:
 
 
 def _server_view(r: dict) -> Optional[dict]:
-    """What the 4510 reply says about the market we bet on."""
+    """What a 4510 reply says about the market we bet on."""
     try:
         sent = (r.get("_sent") or {}).get("selection") or {}
         parts = str(sent.get("id", "")).split("/")          # uof:1/sr:sport:1/8/6?goalnr=2
@@ -281,59 +285,14 @@ def _diag_4510(r: dict) -> str:
 
 
 def _fix_from_4510(r: dict) -> str:
-    """The server's probability to retry with - ONLY when the market is open and active, the
-    odds are exactly what we sent and only the probability differs. Anything else: no retry."""
+    """The server's probability to retry with - ONLY when the market is open and active, the odds are exactly
+    what we sent and only the probability differs. Anything else: no retry."""
     v = _server_view(r)
     if not v or v["status"] != 0 or v["active"] in (0, "0", False) or not v["prob"]:
         return ""
     if abs(v["odds"] - v["sent_odds"]) >= 0.005 or _prob_same(v["prob"], v["sent_prob"]):
         return ""
     return v["prob"]
-
-
-def _wat(ts: Optional[float]) -> str:
-    """Nigeria time (WAT = UTC+1, no daylight saving) with milliseconds."""
-    from datetime import datetime, timedelta, timezone
-    t = datetime.fromtimestamp(float(ts or time.time()), timezone(timedelta(hours=1)))
-    return t.strftime("%H:%M:%S.") + f"{t.microsecond // 1000:03d} WAT"
-
-
-def _clock_line(r: dict, t0: float) -> str:
-    """For a failed order: when SportyBet last changed the price of the market we bet on (its own clock)."""
-    try:
-        sent = (r.get("_sent") or {}).get("selection") or {}
-        mid = str(sent.get("id", "")).split("/")[-2]
-        spec = str(sent.get("specifier") or "")
-        for ev in ((r.get("data") or {}).get("fcOutcomes") or []):
-            for m in ev.get("markets") or []:
-                if str(m.get("id")) == mid and (not spec or str(m.get("specifier") or "") == spec) \
-                        and m.get("lastOddsChangeTime"):
-                    ms = int(float(m["lastOddsChangeTime"]))
-                    d = int(ms - t0 * 1000)
-                    return (f"🕐 SportyBet last price change: {_wat(ms / 1000)} -> "
-                            f"{abs(d)} ms {'AFTER' if d >= 0 else 'BEFORE'} our goal frame")
-    except Exception:
-        pass
-    return ""
-
-
-def _mkt_state(m: Optional[dict]) -> str:
-    """Plain-words state of a market in the SportyBet event reply."""
-    if m is None:
-        return "NOT IN REPLY (removed)"
-    if m.get("banned") in (True, 1, "true"):
-        return "BANNED"
-    st = _to_int(m.get("status"), 0)
-    if st == 2:
-        return "SUSPENDED (status 2)"
-    if st == 3:
-        return "SETTLED/CLOSED (status 3)"
-    if st != 0:
-        return f"NOT OPEN (status {st})"
-    outs = [o for o in (m.get("outcomes") or []) if isinstance(o, dict)]
-    if outs and all(o.get("isActive") in (0, "0", False) for o in outs):
-        return "OPEN but every outcome LOCKED"
-    return "open"
 
 
 def _label_key(s: str) -> str:
@@ -395,6 +354,27 @@ def _api_phase(data: Any) -> str:
                 if ph:
                     return ph
     return ""
+
+
+def _api_clock(data: Any) -> Optional[float]:
+    """Minutes played, from the event reply's 'playedSeconds' ('88:18' = 88 min 18 s). None if not there."""
+    if not isinstance(data, dict):
+        return None
+    queue: List[Tuple[dict, int]] = [(data, 0)]
+    while queue:
+        sc, depth = queue.pop(0)
+        for k, v in sc.items():
+            kl = str(k).lower()
+            if kl in ("markets", "outcomes"):
+                continue
+            if isinstance(v, dict):
+                if depth < 3:
+                    queue.append((v, depth + 1))
+            elif kl == "playedseconds":
+                m = re.match(r"\s*(\d+)(?::(\d+))?", str(v))
+                if m:
+                    return int(m.group(1)) + (int(m.group(2)) / 60.0 if m.group(2) else 0.0)
+    return None
 
 
 def _api_fields(data: Any) -> str:
@@ -754,7 +734,7 @@ class SportyBetClient:
             spec = str(m.get("specifier") or m.get("specifiers") or "")
             ms = re.search(r"goalnr=(\d+)", spec)
             if not ms and not re.fullmatch(r"(?:(?:1st|2nd) Half - )?\d{1,2}(?:st|nd|rd|th) Goal", desc.strip(), re.I):
-                continue          # TIME-WINDOW markets ("5 minutes - 1st goal from 26 to 30") are NOT next-goal markets
+                continue                                   # time-window markets ("5 minutes - 1st goal from 26 to 30") are NOT next-goal markets
             gnum = int(ms.group(1)) if ms else (_goal_num_in_name(both) or goal_no)
             pr = _period_rank(both)
             if goal_no is not None and gnum is not None and gnum != goal_no:
@@ -891,67 +871,6 @@ class SportyBetClient:
         resp["_odds"], resp["_stake"] = float(odds), float(stake)
         return resp
 
-    # ---------- WARM CHANNEL: connection + encryption channel opened BEFORE the goal ----------
-    @staticmethod
-    def _alive(c) -> bool:
-        """True while the idle connection is still open. A server that closed it shows up as
-        'readable', so this is checked BEFORE an order is written to it."""
-        try:
-            import select
-            sk = c.sock
-            if sk is None:
-                return False
-            if getattr(sk, "pending", None) and sk.pending() > 0:
-                return False
-            return not select.select([sk], [], [], 0)[0]
-        except Exception:
-            return False
-
-    def warm_channel(self) -> Optional[dict]:
-        """Opens ONE connection + encryption channel ahead of time. Nothing is ordered."""
-        c = self._new_conn()
-        try:
-            aes, tid = self._open_channel_on(c)
-        except Exception:
-            try:
-                c.close()
-            except Exception:
-                pass
-            return None
-        if not aes or not tid:
-            try:
-                c.close()
-            except Exception:
-                pass
-            return None
-        return {"c": c, "aes": aes, "tid": tid, "t": time.time()}
-
-    def place_warm(self, ch: dict, arm: ArmedSelection, stake: float, odds: float) -> dict:
-        """Sends bet 1 on a channel opened ahead of time. The channel is used ONCE and closed.
-        '_unread' = the server never read the order (connection already closed, or 19414), so
-        placing it again on a fresh channel is safe. Any other failure is NEVER re-sent."""
-        arm = replace(arm, odds=float(odds))
-        order, sel = self._build_order(arm, stake)
-        c = ch["c"]
-        try:
-            if not self._alive(c):
-                return {"bizCode": -4, "message": "warm connection was closed", "_unread": True}
-            try:
-                resp = self._send_on(c, ch["aes"], ch["tid"], "/api/ng/orders/order", order)
-            except Exception as e:
-                resp = {"bizCode": -2, "message": f"{type(e).__name__}: {e}"}
-            if resp.get("bizCode") == 19414:
-                resp["_unread"] = True
-        finally:
-            try:
-                c.close()
-            except Exception:
-                pass
-        resp["_sent"] = {"selection": sel, "stake": stake, "fresh_conn": False, "warm": True,
-                         "acceptOddsChange": bool(Config.ACCEPT_ODDS_CHANGE)}
-        resp["_odds"], resp["_stake"] = float(odds), float(stake)
-        return resp
-
     # ---------- CASH OUT: the standalone cashout.py flow, on a fresh connection ----------
     def cashout_bet(self, bet_id: str, stake: float, amount: float) -> dict:
         c = self._new_conn()
@@ -1044,25 +963,92 @@ class SportyBetClient:
                 notes.append(f"{bid}: {type(e).__name__}: {e}")
         return ok, fail, notes
 
+    def get_balance(self) -> Optional[float]:
+        """The real balance in naira, from the call the SportyBet site itself makes (the value is in 1/10000 naira)."""
+        try:
+            j = self._getjson("/api/ng/pocket/v1/wallet/assetsInfo", {"_t": int(time.time() * 1000)})
+            v = (j.get("data") or {}).get("balance")
+            return float(v) / 10000.0 if v is not None else None
+        except Exception as e:
+            logger.warning(f"[SPORTY] balance: {type(e).__name__}: {e}")
+            return None
+
+    def market_open(self, data: dict, bet: dict) -> bool:
+        """True when the market this bet was placed on is open again (status 0) in the event API."""
+        try:
+            for m in self._markets(data):
+                mid = str(m.get("id") or m.get("marketId") or "")
+                spec = str(m.get("specifier") or m.get("specifiers") or "")
+                if mid == str(bet.get("market_id")) and spec == str(bet.get("specifier") or "") \
+                        and _to_int(m.get("status"), -1) == 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def find_bet_ids(self, order_id: str, event_id: str, claimed: set) -> List[str]:
+        """The cash-out id of a bet: the open bet whose record contains this ORDER id; if none does,
+        the open bets that contain this match's event id. Ids already taken by another bet are skipped."""
+        try:
+            lst = self._getjson("/api/ng/realSportsGame/cashAbleBets",
+                                {"pageSize": 30, "pageNum": 1, "_t": int(time.time() * 1000)}, CASH_REF)
+        except Exception as e:
+            logger.warning(f"[SPORTY] cashAbleBets: {type(e).__name__}: {e}")
+            return []
+        by_order: List[str] = []
+        by_event: List[str] = []
+
+        def walk(n):
+            if isinstance(n, dict):
+                bid = n.get("id") or n.get("betId")
+                if bid and "bet" in str(bid) and str(bid) not in claimed:
+                    dump = json.dumps(n, default=str)
+                    if order_id and order_id in dump:
+                        by_order.append(str(bid))
+                    elif event_id and event_id in dump:
+                        by_event.append(str(bid))
+                for v in n.values():
+                    walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    walk(v)
+
+        walk(lst.get("data"))
+        return list(dict.fromkeys(by_order or by_event))
+
+    def cashout_one(self, bet: dict, claimed: set) -> dict:
+        """Cash out ONE bet. {'ok': True} when done; otherwise why not (the caller keeps polling)."""
+        try:
+            bid = str(bet.get("bet_id") or "")
+            if not bid:
+                ids = self.find_bet_ids(str(bet.get("order_id") or ""), str(bet.get("event_id") or ""), claimed)
+                if not ids:
+                    return {"ok": False, "why": "bet not listed as cashable yet"}
+                bid = ids[0]
+                bet["bet_id"] = bid
+            claimed.add(bid)
+            off = self._getjson("/api/ng/realSportsGame/cashAbleBet",
+                                {"betId": bid, "_t": int(time.time() * 1000)}, CASH_REF)
+            d = off.get("data") or {}
+            co = d.get("cashOut") or {}
+            amt = float(co.get("maxCashOutAmount") or 0)
+            stake = float(d.get("stake") or 0)
+            if amt <= 0:
+                return {"ok": False, "why": "no cash-out offer yet"}
+            r = self.cashout_bet(bid, stake, amt)
+            if r.get("bizCode") == 10000:
+                return {"ok": True, "amount": amt, "bet_id": bid}
+            return {"ok": False, "why": _brief(r)}
+        except Exception as e:
+            return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+
 
 # =====================================================================
 # SPORTYBET DOM  (headless browser, kept alive, reads odds)
 # =====================================================================
-# Verified page structure (from your captures):
-#   div.m-table__wrapper -> header line ("2nd Goal" / "1st Half - 2nd Goal") + div.m-table >
-#   div.m-table-row.m-outcome > div.m-table-cell  "Home 5.90" | "None 1.42" | "Away 5.10"
-#
-# FINDING a market block: a cheap textContent pre-filter (does the block contain the header,
-# followed by Home / Away / None?) picks the 1-2 candidates, then the block's FIRST VISIBLE LINE
-# (innerText) must equal the header exactly — that exact check is what keeps "2nd Goal" from
-# matching "1st Half - 2nd Goal", and it is the same text the "Page markets" list shows.
-# The block found is remembered in the page, so later reads touch ONE element and need no layout.
-# If the pre-filter finds nothing, an exact header scan runs as a safety net (at most every 3 s).
-#
-# READING a price from the block (three steps, first hit wins):
-#   1. "Home 2.95" / "Away 3.35" pattern in the block's text
-#   2. cell by cell: the div.m-table-cell whose text starts with Home / Away
-#   3. by position: 3 cells = Home, None, Away (last number with a decimal point in the cell)
+# A market block is found by its TITLE (the first text pieces of div.m-table__wrapper - never the hidden
+# description text, never innerText, so no page layout is forced) and its price is read from the Home / Away
+# cells. The block found is remembered, so later reads touch ONE element.
 DOM_JS = """(pairs) => {
   const key = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const cache = (window.__bbw = window.__bbw || {});
@@ -1165,7 +1151,7 @@ DOM_HEADERS_JS = """() => Array.from(document.querySelectorAll('div.m-table__wra
     return '';
   }).filter(Boolean)"""
 
-# Diagnostics: what the block with this header REALLY contains, cell by cell (classes + text).
+# Diagnostics: what the block with this header REALLY contains, cell by cell.
 DOM_PROBE_JS = """(labels) => {
   const key = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const wanted = (labels || []).map(key);
@@ -1185,32 +1171,6 @@ DOM_PROBE_JS = """(labels) => {
     out.push(hit + ' => ' + (cells.join(' | ') || '(no cells)'));
   }
   return out.slice(0, 3);
-}"""
-
-DOM_CELL_JS = """(args) => {
-  const key = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const want = key(args[0]);
-  const side = args[1];
-  for (const w of document.querySelectorAll('div.m-table__wrapper')) {
-    const tw = document.createTreeWalker(w, NodeFilter.SHOW_TEXT);
-    let acc = '', n = 0, node, hit = false;
-    while (n < 5 && (node = tw.nextNode())) {
-      const t = (node.data || '').replace(/\\s+/g, ' ').trim();
-      if (!t) continue;
-      acc += t; n++;
-      if (key(acc) === want) { hit = true; break; }
-    }
-    if (!hit) continue;
-    for (const c of w.querySelectorAll('div.m-table-cell')) {
-      const t = (c.textContent || '').replace(/\\s+/g, ' ').trim();
-      if (t.toLowerCase().startsWith(side)) {
-        const cls = (c.className || '').replace(/m-table-cell--checked/g, '').replace(/\\s+/g, ' ').trim();
-        return {found: true, cls: cls, txt: t, num: /[0-9]+[.,][0-9]+/.test(t.slice(side.length))};
-      }
-    }
-    return {found: true, cls: '', txt: '(cell not found)', num: false};
-  }
-  return {found: false};
 }"""
 
 DOM_STATUS_JS = """() => {
@@ -1277,7 +1237,7 @@ class SportyBetDom:
 
     async def open(self, url: str) -> bool:
         """Loads the match page headless. Only counts as OPEN when the server answered HTTP 200
-        and the market tables are on the page."""
+        and the market tables are on the page (reloads the page up to 2 times if they are not)."""
         from playwright.async_api import async_playwright
         await self.close()
         self.http_status = 0
@@ -1352,12 +1312,6 @@ class SportyBetDom:
         except Exception:
             return None
 
-    async def watch(self, labels_home, labels_away) -> bool:
-        """(Re)points the in-page price watcher at these market headers."""
-        v = await self._eval(WATCH_JS, {"home": list(labels_home or []),
-                                        "away": list(labels_away or [])}, 2.0)
-        return bool(v)
-
     async def reload(self) -> None:
         page = self._page
         if page and not page.is_closed():
@@ -1366,15 +1320,11 @@ class SportyBetDom:
             except Exception as e:
                 logger.warning(f"[DOM] reload: {e!r}")
 
-    async def cell_state(self, label: str, side: str) -> Optional[Tuple[str, str]]:
-        """(open/closed signature, text) of the Home / Away cell of this market on the page.
-        ('gone', ...) = the market is no longer on the page.  None = page could not be read in time."""
-        v = await self._eval(DOM_CELL_JS, [label, side.lower()], 1.0)
-        if not isinstance(v, dict):
-            return None
-        if not v.get("found"):
-            return ("gone", "(market not on the page)")
-        return (f"{v.get('cls', '')}|{'num' if v.get('num') else 'nonum'}", str(v.get("txt", "")))
+    async def watch(self, labels_home, labels_away) -> bool:
+        """(Re)points the in-page price watcher at these market headers."""
+        v = await self._eval(WATCH_JS, {"home": list(labels_home or []),
+                                        "away": list(labels_away or [])}, 2.0)
+        return bool(v)
 
     async def market_count(self) -> int:
         v = await self._eval("document.querySelectorAll('div.m-table__wrapper').length")
@@ -1431,7 +1381,7 @@ class SportyBetDom:
 
 
 # =====================================================================
-# BET365 FEED  (fast: parse only, no telegram goal alerts)
+# BET365 SCORE FEED  (SS parsing - CASHES OUT when a score goes down, keeps the goal count right)
 # =====================================================================
 CHROME = os.getenv("BET365_CHROME", "/usr/bin/google-chrome")
 RUN_AS = os.getenv("BET365_RUN_AS", "botuser")
@@ -1444,7 +1394,7 @@ DISALLOW_CONFIRM = float(os.getenv("DISALLOW_CONFIRM_SECS", "0.6"))
 LIST_FLUSH_SECS = float(os.getenv("BET365_LIST_FLUSH_SECS", "12"))
 ANNOUNCED_FILE = Path.home() / ".betbot_announced.json"   # FIs already sent to Telegram
 
-# FI = the bet365 fixture (match) ID. Only FI is ever used as the match number.
+# FI = the bet365 fixture (match) ID.
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
 RE_NA = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
 RE_SS = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2}\s*[-:]\s*\d{1,2})", re.I)
@@ -1485,10 +1435,7 @@ class ScoreTracker:
         fields belong to that one topic.
     Child records (MA / PA / CT / stats ...) are ignored and the FI context never leaks
     from one record into the next (that leak produced the fake '41-37').
-    A goal is ONLY a one-side +1 step; anything else is treated as noise.
-
-    A step on the LOCKED game is reported through on_change() the instant it is parsed —
-    before the rest of the frame is read."""
+    A goal is ONLY a one-side +1 step; anything else is treated as noise."""
 
     def __init__(self):
         self.state: Dict[str, dict] = {}
@@ -1517,12 +1464,12 @@ class ScoreTracker:
                         h, a, ss = nh, na, f"{nh}-{na}"
                         self._pending.pop(fi, None)
                         if fi == self.watch_fi and self.on_change:
-                            self.on_change(fi, ph, pa, nh, na, nm)       # GOAL: act right now
+                            self.on_change(fi, ph, pa, nh, na, nm)       # act right now
                     else:                                      # a jump: noise unless it repeats
                         pend = self._pending.get(fi)
                         if pend and pend[0] == (nh, na) and time.time() - pend[1] <= 15:
                             if fi == self.watch_fi:            # other sports resync all day: no log spam
-                                logger.warning(f"[FEED] resync FI {fi}: {h}-{a} -> {nh}-{na} (no bet)")
+                                logger.warning(f"[FEED] resync FI {fi}: {h}-{a} -> {nh}-{na}")
                             h, a, ss = nh, na, f"{nh}-{na}"
                             self._pending.pop(fi, None)
                         else:
@@ -1731,7 +1678,7 @@ class Bet365Feed:
         self._list_task = self._task = None
         await self._teardown()
 
-    # ---------- fast frame path: no awaits, no telegram ----------
+    # ---------- frame path: no awaits, no telegram ----------
     def _on_frame(self, ev):
         try:
             payload = getattr(ev, "payload", ev)
@@ -1746,7 +1693,7 @@ class Bet365Feed:
         if self._raw_fi and self._raw_fi in text:             # /raw FI diagnostic
             self._raw_buf.append(text.encode("unicode_escape").decode()[:700])
         self._last_data_at = time.time()
-        self.tracker.feed(text)                                # a goal fires from inside here
+        self.tracker.feed(text)                                # a score step fires from inside here
         for fi in self.tracker.touched:
             s = self.tracker.state.get(fi) or {}
             n = s.get("name") or ""
@@ -1757,6 +1704,10 @@ class Bet365Feed:
         """Called by the tracker the moment the LOCKED game's score steps by one."""
         if fi != self._watch:
             return
+        try:
+            _dlog(f"SCORE_FEED fi={fi} {ph}-{pa} -> {h}-{a}")
+        except Exception:
+            pass
         pt, t = ph + pa, h + a
         base = {"match_id": fi, "name": name, "prev_ss": f"{ph}-{pa}",
                 "ss": f"{h}-{a}", "home_score": h, "away_score": a, "ts": time.time()}
@@ -1969,6 +1920,420 @@ class Bet365Feed:
 
 
 # =====================================================================
+# BET365 GOAL SIGNAL = the bet365 MATCH page. The pitch marker (ST;LE=GO...) OR the ticker line (ST;ET=1),
+# whichever lands first, ONE signal per goal.  A record is a NEW goal unless it is:
+#   - inside the first PITCH_QUIET_SECS of the match records (the history bet365 replays when the page opens),
+#   - a goal older than PITCH_FRESH_MINUTES on the match clock (old history that arrives late),
+#   - the exact same record again, or the other source's signal for the SAME goal (same team, PITCH_DEBOUNCE s).
+# The message type byte (0x14 / 0x15) is NOT used: bet365 sends live goals in both.
+# =====================================================================
+_FIELD_RE = re.compile(r"^([A-Z0-9]{1,4})=")
+
+
+def _pitch_records(body: bytes) -> List[Tuple[str, Dict[str, str]]]:
+    recs: List[Tuple[str, Dict[str, str]]] = []
+    ctype: Optional[str] = None
+    cur: Dict[str, str] = {}
+    for tok in body.split(b";"):
+        if not tok:
+            continue
+        st = tok.decode("latin-1").strip("|")
+        if not st:
+            continue
+        if "=" in st and _FIELD_RE.match(st):
+            k, _, v = st.partition("=")
+            cur[k] = v
+        else:
+            if ctype is not None:
+                recs.append((ctype, cur))
+            ctype, cur = st, {}
+    if ctype is not None:
+        recs.append((ctype, cur))
+    return recs
+
+
+def _pitch_minute(f: Dict[str, str]) -> str:
+    m = re.search(r"#(\d+)'#", f.get("PD", "") or "")
+    return m.group(1) if m else (f.get("TM", "") or "")
+
+
+PATCH2_APPLIED = True
+PITCH_LOG = Path.home() / "betbot_pitch.log"
+
+
+def _plog(line: str) -> None:
+    """Every goal record the match-page feed receives, and every decision, with UTC time, in its own file."""
+    try:
+        if PITCH_LOG.exists() and PITCH_LOG.stat().st_size > 5_000_000:
+            PITCH_LOG.replace(PITCH_LOG.with_suffix(".log.1"))
+        with PITCH_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) + " UTC | " + line + "\n")
+    except Exception:
+        pass
+
+
+def _goal_n(f: Dict[str, str]) -> Optional[int]:
+    """ID=1003-3 -> 3: the goal number counted from 0, both teams together (the real goal number is n + 1)."""
+    m = re.match(r"^\d+-(\d+)$", (f.get("ID") or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def _units_balance(r: Any) -> Optional[float]:
+    """A SportyBet reply carries the balance in 1/10000 naira (73896700 = N7,389.67)."""
+    try:
+        return float((r.get("data") or {}).get("balance")) / 10000.0
+    except Exception:
+        return None
+
+
+PATCH3_APPLIED = True
+
+
+def _api_ended(data: Any) -> bool:
+    """True when a status-like field of the SportyBet event reply says the match is OVER (ended / finished / full time).
+    'closed' is NOT used: a market or the betting can be closed in the middle of a match."""
+    if not isinstance(data, dict):
+        return False
+    queue: List[Tuple[dict, int]] = [(data, 0)]
+    while queue:
+        sc, depth = queue.pop(0)
+        for k, v in sc.items():
+            kl = str(k).lower()
+            if kl in ("markets", "outcomes"):
+                continue
+            if isinstance(v, dict):
+                if depth < 3:
+                    queue.append((v, depth + 1))
+                continue
+            if isinstance(v, bool):
+                if v and kl in ("ended", "isended", "finished", "isfinished", "matchended"):
+                    return True
+                continue
+            if isinstance(v, (str, int)) and any(w in kl for w in ("status", "state", "period", "phase")):
+                s = str(v).strip().lower()
+                if kl == "matchstatus" and s == "100":
+                    return True
+                if re.search(r"\b(ended|finished|full ?time|ft|aet)\b", re.sub(r"[^a-z0-9 ]+", " ", s)):
+                    return True
+    return False
+
+
+# ---------- timing log (log-only: never raises, never affects the bot) ----------
+TIMING_LOG = Path.home() / "betbot_timing.log"
+_TL_N = [0]
+_MKT: Dict[str, list] = {}
+
+
+def _ts(t: float) -> str:
+    return time.strftime("%H:%M:%S", time.gmtime(t)) + f".{int((t % 1) * 1000):03d}"
+
+
+def _dlog(line: str) -> None:
+    try:
+        _TL_N[0] += 1
+        if _TL_N[0] % 200 == 1 and TIMING_LOG.exists() and TIMING_LOG.stat().st_size > 5_000_000:
+            TIMING_LOG.replace(TIMING_LOG.with_suffix(".log.1"))
+        try:
+            ld = os.getloadavg()[0]
+        except Exception:
+            ld = -1.0
+        with TIMING_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{_ts(time.time())} UTC | load {ld:.2f} | {line}\n")
+    except Exception:
+        pass
+
+
+def _trk_market(res, now: float) -> None:
+    """Logs when the SportyBet page's Home/Away price for the armed market disappears / returns."""
+    try:
+        for sd, det in zip(("home", "away"), res):
+            seen = bool(det and det[0] > 1.01)
+            st = _MKT.get(sd)
+            if st is None:
+                _MKT[sd] = [seen, 0.0]
+                continue
+            if seen:
+                if not st[0]:
+                    _dlog(f"SPORTY_MARKET {sd} OPEN odds={det[0]} {det[1]}")
+                st[0], st[1] = True, 0.0
+            elif st[0]:
+                if st[1] == 0.0:
+                    st[1] = now
+                elif now - st[1] >= 0.3:
+                    _dlog(f"SPORTY_MARKET {sd} GONE (first missed at {_ts(st[1])})")
+                    st[0], st[1] = False, 0.0
+    except Exception:
+        pass
+
+
+class PitchFeed:
+    def __init__(self, feed):
+        self.feed = feed
+        self.cb: Optional[Callable[[dict], None]] = None
+        self.fresh_cb: Optional[Callable[[int], bool]] = None     # is a goal of this match minute recent enough?
+        self.url = self.ev = self.fi = ""
+        self.page = None
+        self._bid = None
+        self._task: Optional[asyncio.Task] = None
+        self.team: Dict[str, str] = {}
+        self._goal_seen: set = set()
+        self._goal_q: deque = deque()
+        self._last_fire: Dict[str, float] = {}
+        self.last_fire = 0.0
+        self.frames = self.ignored = self.fired = self.dupes = 0
+        self.first_rec_at = self.last_frame_at = 0.0
+        self.log: deque = deque(maxlen=10)                        # last decisions, shown by /pitch
+        self.state = "idle"
+
+    # ---------- control ----------
+    def open(self, url: str, fi: str) -> bool:
+        self.reset()
+        m = re.search(r"/EV(\d{6,})", url or "")
+        if not m:
+            self.state = "bad url"
+            return False
+        self.url, self.ev, self.fi = url.strip(), m.group(1), str(fi)
+        self.state = "starting"
+        self._task = asyncio.ensure_future(self._run())
+        return True
+
+    def reset(self) -> None:
+        t, self._task = self._task, None
+        if t and not t.done():
+            t.cancel()
+        pg, self.page = self.page, None
+        if pg is not None:
+            try:
+                asyncio.ensure_future(self._close_page(pg))
+            except Exception:
+                pass
+        self.url = self.ev = self.fi = ""
+        self.team.clear()
+        self._goal_seen.clear()
+        self._goal_q.clear()
+        self._last_fire.clear()
+        self.last_fire = 0.0
+        self.frames = self.ignored = self.fired = self.dupes = 0
+        self.first_rec_at = self.last_frame_at = 0.0
+        self.ws_at = 0.0
+        self.log.clear()
+        self._bid = None
+        self.state = "idle"
+
+    @staticmethod
+    async def _close_page(pg) -> None:
+        try:
+            await asyncio.wait_for(pg.close(), timeout=4)
+        except Exception:
+            pass
+
+    async def _tell(self, text: str) -> None:
+        a = getattr(self.feed, "alerter", None)
+        if a:
+            try:
+                await a.send(text)
+            except Exception:
+                pass
+
+    async def _new_page(self, br) -> None:
+        try:
+            ctxs = br.contexts
+            ctx = ctxs[0] if ctxs else await br.new_context()
+            page = await ctx.new_page()
+            page.on("websocket", self._on_ws)
+            self.page, self._bid = page, id(br)
+            self.frames = 0
+            self.first_rec_at = self.last_frame_at = 0.0         # the page replays the history again: quiet window restarts
+            self.state = "loading the match page"
+            await page.goto(self.url, wait_until="commit", timeout=45000)
+            asyncio.ensure_future(self.feed._cookies(page))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[PITCH] open page: {type(e).__name__}: {e}")
+
+    async def _run(self) -> None:
+        opened_at, told_conn, told_silent, told_url, regoto = 0.0, False, False, False, 0
+        try:
+            while self.url:
+                br = getattr(self.feed, "_browser", None)
+                if br is None:
+                    self.state = "waiting for Chrome"
+                    await asyncio.sleep(0.5)
+                    continue
+                if self.page is None or self.page.is_closed() or self._bid != id(br):
+                    self.page = None
+                    await self._new_page(br)
+                    opened_at, told_conn, told_silent, told_url, regoto = time.time(), False, False, False, 0
+                    if self.page is None:
+                        await asyncio.sleep(3.0)
+                        continue
+                    try:
+                        await self.page.bring_to_front()          # a hidden tab can be throttled by Chrome
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.0)
+                now = time.time()
+                if self.frames and not told_conn:
+                    told_conn = True
+                    self.state = "connected"
+                    await self._tell(f"🎬 Goal feed connected - match page EV{self.ev}, frames flowing")
+                if not self.frames and now - opened_at > 25 and not told_silent:
+                    told_silent = True
+                    self.state = "no frames"
+                    await self._tell(f"⚠️ Match page open for 25 s but NO frames yet. Check the Bet365URL- link: {self.url}")
+                if self.last_frame_at and now - self.last_frame_at > 30 and now - opened_at > 30:
+                    self.last_frame_at = now                      # stalled connection: reload the match page right away
+                    self.state = "reconnecting (no frames for 30 s)"
+                    await self._tell("⚠️ Goal feed: no frames for 30 s - reloading the match page")
+                    try:
+                        await self.page.reload(wait_until="commit", timeout=45000)
+                    except Exception:
+                        pass
+                try:
+                    u = self.page.url or ""
+                except Exception:
+                    u = ""
+                if self.ev in u:
+                    regoto = 0
+                elif now - opened_at > 8:
+                    if regoto < 3:
+                        regoto += 1
+                        try:
+                            await self.page.goto(self.url, wait_until="commit", timeout=45000)
+                        except Exception:
+                            pass
+                    elif not told_url:
+                        told_url = True
+                        await self._tell("⚠️ bet365 keeps leaving the match page (the match may be over or the link is wrong).")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[PITCH] run: {type(e).__name__}: {e}")
+
+    # ---------- frames (hot path: byte checks first, nothing built for frames we do not need) ----------
+    def _on_ws(self, ws) -> None:
+        try:
+            u = (getattr(ws, "url", "") or "").lower()
+            if "zap" in u or "sportspublisher" in u:
+                self.ws_at = time.time()        # a new connection replays the match history: the feed only LEARNS for HISTORY_SECS
+                _plog(f"WEBSOCKET opened: {u[:90]}")
+                ws.on("framereceived", self._on_frame)
+        except Exception:
+            pass
+
+    def _on_frame(self, ev) -> None:
+        t = time.time()
+        try:
+            x = getattr(ev, "payload", ev)
+            data = bytes(x) if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8", "surrogateescape")
+        except Exception:
+            return
+        self.last_frame_at = t
+        self.frames += 1
+        if b"LE=" not in data and b"ET=1" not in data and b"TE;" not in data and b"TE=" not in data:
+            return
+        try:
+            for frame in data.split(b"\x08"):
+                if b"|" not in frame:
+                    continue
+                head, _, body = frame.partition(b"|")
+                if len(head) < 2:
+                    continue
+                mtype = head[0]                                   # 0x14 = snapshot, 0x15 = update
+                topic = head[1:].split(b"\x01")[0].decode("latin-1")
+                body = body.lstrip(b"|")
+                if b"LE=" not in body and b"ET=1" not in body and b"TE;" not in body and b"TE=" not in body:
+                    continue
+                first = body.split(b";", 1)[0]
+                if b"=" in first and b"LE=GO" in body and self._mine("", topic):
+                    _plog("UNREADABLE goal-looking update frame: " + topic + " | " + body[:300].decode("latin-1"))
+                for rtype, f in _pitch_records(body):
+                    it = f.get("IT") or ""
+                    if not self._mine(it, topic):
+                        if f.get("LE", "").startswith("GO"):
+                            _plog("DROPPED goal record (not this match): " + it + " | " + topic)
+                        continue
+                    if not self.first_rec_at:
+                        self.first_rec_at = t
+                    if rtype == "TE":
+                        if f.get("NA"):
+                            self.team[f.get("ID", "")] = f["NA"]
+                    elif rtype == "ST":
+                        if f.get("LE", "").startswith("GO"):
+                            self._goal(f, t, mtype, topic)
+                        elif f.get("ET") == "1":
+                            _plog("ticker line (log only): " + ";".join(f"{k}={v}" for k, v in f.items())[:300])
+        except Exception as e:
+            logger.warning(f"[PITCH] parse: {type(e).__name__}: {e}")
+
+    def _note(self, src: str, minute: str, tid: str, what: str) -> None:
+        try:
+            _dlog(f"DECISION {src} min={minute} team={tid} -> {what}")
+        except Exception:
+            pass
+        self.log.append(f"{time.strftime('%H:%M:%S')} {src} {minute or '?'}' team {tid or '?'} -> {what}")
+
+    def _signal(self, src: str, f: Dict[str, str], t: float) -> None:
+        tid = f.get("TE") or f.get("TI") or ""
+        minute = _pitch_minute(f)
+        try:
+            _dlog(f"SIGNAL {src} min={minute} team={tid} id={f.get('ID')} in_bot_ms={(time.time() - t) * 1000:.1f}")
+        except Exception:
+            pass
+        rec = (src, tid, minute, tuple(sorted(f.items())))
+        if rec in self._goal_seen:                                   # the exact same record again
+            self.dupes += 1
+            return
+        self._goal_seen.add(rec)
+        self._goal_q.append(rec)
+        if len(self._goal_q) > 3000:
+            self._goal_seen.discard(self._goal_q.popleft())
+        if t - self.first_rec_at < Config.PITCH_QUIET_SECS:          # the history bet365 replays when the page opens
+            self.ignored += 1
+            self._note(src, minute, tid, "history (page just opened)")
+            return
+        if minute.isdigit() and self.fresh_cb is not None and not self.fresh_cb(int(minute)):
+            self.ignored += 1                                        # an old goal that arrived late
+            self._note(src, minute, tid, "old goal (history)")
+            return
+        if t - self._last_fire.get(tid, 0.0) < Config.PITCH_DEBOUNCE or t - self.last_fire < 3.0:
+            self.dupes += 1                                          # the other source's signal for the same goal
+            self._note(src, minute, tid, "same goal (other source)")
+            return
+        self._last_fire[tid] = self.last_fire = t
+        self.fired += 1
+        self._note(src, minute, tid, "FIRED")
+        cb = self.cb
+        if cb:
+            cb({"kind": "goal", "src": src, "tid": tid, "ts": t, "minute": minute, "xy": f.get("XY", ""),
+                "le": f.get("LE", "") or "ticker", "team": self.team.get(tid, ""),
+                "raw": ";".join(f"{k}={v}" for k, v in f.items())})
+
+    def _mine(self, it: str, topic: str) -> bool:
+        """A record belongs to this match if it carries the long number of the match link (EV) OR the fixture number (FI)."""
+        keys = [k for k in (self.ev, self.fi) if k]
+        if not keys:
+            return True
+        return any(k in it or k in topic for k in keys)
+
+    def _goal(self, f: Dict[str, str], t: float, mtype: int, topic: str) -> None:
+        """One goal record (LE=GO). No decision here: it goes straight to the bot with its goal number.
+        From the logs: every REPLAYED goal arrived in a 0x14 (snapshot) frame and the live goal in a 0x15 (update) frame,
+        so 0x14 = history candidate, 0x15 = live candidate. (The bot still checks the goal number against the score.)"""
+        n = _goal_n(f)
+        tid = f.get("TE") or f.get("TI") or ""
+        hist = (mtype == 0x14)
+        raw = ";".join(f"{k}={v}" for k, v in f.items())
+        _plog(f"GOAL record type=0x{mtype:02x} history={hist} n={n} team={tid} topic={topic} | {raw[:300]}")
+        cb = self.cb
+        if cb:
+            cb({"kind": "goal", "src": "pitch", "gid": f.get("ID", ""), "n": n, "tid": tid, "ts": t,
+                "minute": _pitch_minute(f), "hist": hist, "mtype": mtype,
+                "team": self.team.get(tid, ""), "raw": raw})
+
+
+# =====================================================================
 # TELEGRAM
 # =====================================================================
 class TelegramAlerter:
@@ -2050,7 +2415,7 @@ class TelegramAlerter:
             f"Hard cap: <b>₦{Config.MAX_PROFIT_PER_BET:,.0f}</b>\n\n"
             f"<code>/startbot</code>  <code>/stopbot</code>  <code>/clear</code>\n"
             f"<code>/matches</code>  <code>/login PHONE PASS</code>  <code>/balance N</code>\n"
-            f"<code>/switch</code>  <code>/status</code>  <code>/shutdown</code>")
+            f"<code>/switch</code>  <code>/status</code>  <code>/pitch</code>  <code>/shutdown</code>")
 
     async def notify_ready(self, teams, fi, ss, event_id, next_goal, arms, dom_ok, extra="", dom_note=""):
         h, a = arms.get("home"), arms.get("away")
@@ -2146,7 +2511,9 @@ class TelegramCommandHandler:
                 f"Hard cap ₦{Config.MAX_PROFIT_PER_BET:,.0f}\n\n"
                 "<code>/startbot</code> start\n<code>/stopbot</code> stop\n"
                 "<code>/clear</code> clear slow\n<code>/matches</code> all live: FI + score + names\n"
-                "<code>/slow</code> then lines: <code>SportyBet- URL</code>  <code>Bet365- FI</code>  <code>Home- team</code>  <code>Away- team</code>\n"
+                "<code>/slow</code> then lines: <code>SportyBet- URL</code>  <code>Bet365URL- bet365 match link</code>  "
+                "<code>Home- team</code>  <code>Away- team</code>  (<code>Bet365- FI</code> only if the match is not found by names)\n"
+                "<code>/pitch</code> goal feed status + last decisions · <code>/pitch off</code> / <code>/pitch on</code>\n"
                 "<code>/switch</code> new SportyBet account  (or <code>/switch PHONE PASS BALANCE</code>)\n"
                 "<code>/status</code> what is running\n"
                 "<code>/raw FI</code> then <code>/raw</code> raw bet365 frames (diagnostic)\n"
@@ -2170,10 +2537,8 @@ class TelegramCommandHandler:
             return
         if low in ("/status", "status"):
             asyncio.create_task(self._safe(self.bot.status_report)); return
-        if low in ("/fast", "/fast on", "/fast off"):
-            asyncio.create_task(self._safe(self.bot.set_fast, low)); return
-        if low in ("/warmtest", "warmtest"):
-            asyncio.create_task(self._safe(self.bot.warm_test)); return
+        if low in ("/pitch", "/pitch on", "/pitch off"):
+            asyncio.create_task(self._safe(self.bot.pitch_cmd, low)); return
         if low in ("/shutdown", "shutdown"):
             asyncio.create_task(self._safe(self.bot.request_shutdown)); return
         if low in ("/switch", "switch"):
@@ -2207,17 +2572,22 @@ class TelegramCommandHandler:
     async def _handle_slow(self, text: str):
         logger.info("[TG] /slow received")
         await self.alerter.send("📥 /slow received — locking…")
-        url = fi = teams = home = away = None
+        url = fi = teams = home = away = b365_url = None
         for line in text.splitlines():
-            m = re.match(r"^\s*(?:/slow\s+)?(sporty\w*|bet365|b365|teams?|home|away)\s*[-:–—]\s*(.*)$",
+            m = re.match(r"^\s*(?:/slow\s+)?(sporty\w*|bet365url|b365url|bet365link|pitch|bet365|b365|teams?|home|away)\s*[-:–—]\s*(.*)$",
                          line.strip(), re.I)
             if not m:
                 continue
             key, body = m.group(1).lower(), m.group(2).strip()
             if key.startswith("sporty"):
                 url = body
+            elif key in ("bet365url", "b365url", "bet365link", "pitch"):
+                b365_url = body
             elif key in ("bet365", "b365"):
-                fi = body
+                if re.match(r"https?://", body, re.I):
+                    b365_url = body
+                else:
+                    fi = body
             elif key == "home":
                 home = body
             elif key == "away":
@@ -2225,22 +2595,25 @@ class TelegramCommandHandler:
             else:
                 teams = body
         if not url:
-            mu = re.search(r"https?://\S+", text)
+            mu = re.search(r"https?://\S*sr:match:\d+\S*", text)
             url = mu.group(0) if mu else None
+        if not b365_url:
+            mb = re.search(r"https?://\S*bet365\S*", text, re.I)
+            b365_url = mb.group(0) if mb else None
         if not url or not re.search(r"sr:match:\d+", url):
             await self.alerter.notify_error("SportyBet- line must contain a URL with sr:match:ID")
             return
-        m = re.search(r"(\d{6,})", fi or "")
-        if not m:
+        if not b365_url or not re.search(r"/EV(\d{6,})", b365_url):
             await self.alerter.notify_error(
-                "Bet365- is empty or not a number. Put the FI from the /matches list, "
-                "e.g.  Bet365- 185402357")
+                "Bet365URL- must be the bet365 MATCH link (it contains /EV and a number), "
+                "e.g.  Bet365URL- https://www.bet365.nl/#/IP/EV15213894932C1")
             return
+        mfi = re.search(r"(\d{6,})", fi or "")
         if bool(home) != bool(away):
             await self.alerter.notify_error("give BOTH  Home-  and  Away-  (or neither)")
             return
-        await self.bot.handle_slow_game(url, m.group(1), teams or "",
-                                        home=home or "", away=away or "")
+        await self.bot.handle_slow_game(url, mfi.group(1) if mfi else "", teams or "",
+                                        home=home or "", away=away or "", b365_url=b365_url)
 
 
 # =====================================================================
@@ -2251,6 +2624,16 @@ class ArbitrageBot:
         self.alerter = TelegramAlerter()
         self.bet365 = Bet365Feed()
         self.bet365.set_alerter(self.alerter)
+        self.pitch = PitchFeed(self.bet365)
+        self.pitch.cb = self._on_pitch_event
+        self.pitch.fresh_cb = self._minute_fresh
+        self._goals = 0                                    # goals played so far in the locked game (pitch + score feed)
+        self._score: List[int] = [0, 0]                    # [home, away] by bet365 slot
+        self._ss_ahead: List[Tuple[float, str]] = []       # goals the score feed counted before the goal feed signalled them
+        self._last_pitch_fire = 0.0
+        self._pitch_bet = True
+        self._side_map: Dict[str, str] = {}
+        self._clock: Optional[Tuple[float, float]] = None  # (match minutes, when read) from the SportyBet API
         self.sb = SportyBetClient()
         self.dom = SportyBetDom()
         self.dom.on_price = self._on_price     # the page pushes every price change straight into the cache
@@ -2270,12 +2653,10 @@ class ArbitrageBot:
         self._keep_task = None
         self._prep_task = None
         self._rearm_task = None
+        self._arm_task = None
         self._alts: Dict[str, List[ArmedSelection]] = {}   # fallbacks per side (1st-half, full-time)
         self._price: Dict[str, Tuple[float, str, float]] = {}   # side -> (odds, page header, read at)
         self._price_task = None
-        self._warm = None
-        self._warm_task = None
-        self._warm_testing = False
         self._half: Optional[int] = None                    # half being played — from the SportyBet API only
         self._half_task = None
         self._arms_half: Optional[int] = None               # half the current arms were built for
@@ -2297,7 +2678,7 @@ class ArbitrageBot:
         st: Dict[str, Any] = {
             "balance": self.balance, "active": self._active,
             "open_bet": self._has_open_bet,
-            "slow": ({"url": self._slow["url"], "fi": self._slow["fi"],
+            "slow": ({"url": self._slow["url"], "fi": self._slow["fi"], "b365_url": self._slow.get("b365_url", ""),
                       "teams": self._slow.get("teams_arg", ""),
                       "home": self._slow.get("home_arg", ""),
                       "away": self._slow.get("away_arg", "")} if self._slow else None)}
@@ -2398,14 +2779,15 @@ class ArbitrageBot:
             "📊 <b>Status</b>\n"
             f"Account: {self._mask(self._creds[0]) if self._creds else 'not logged in'}\n"
             f"Balance: ₦{self.balance:,.2f}\n"
-            f"Bot: {'ON' if self._active else 'OFF'}   Bet365 feed: {'UP' if self.bet365.running else 'down'}\n"
+            f"Bot: {'ON' if self._active else 'OFF'}   Bet365 score feed: {'UP' if self.bet365.running else 'down'}\n"
+            f"Goal feed: {html.escape(self.pitch.state)}\n"
             f"Slow game: {game}\n"
             f"Next goal #{self._next_goal_no}   Half (API): {half}   Open bets: {'yes' if self._has_open_bet else 'no'}\n"
             f"Headless page: {'open' if self.dom.alive else 'closed'}")
 
     async def request_shutdown(self):
         await self.alerter.send("🛑 Shutting the bot process down for good (no auto-restart).\n"
-                                "Start it again from the terminal with <code>python3 main.py</code>")
+                                "Start it again from the terminal with <code>python3 betbot.py</code>")
         self._shutdown.set()
 
     # ---------- process life-cycle ----------
@@ -2439,7 +2821,7 @@ class ArbitrageBot:
             if slow:
                 await self.handle_slow_game(slow["url"], slow["fi"], slow.get("teams", ""),
                                             feed_wait=150.0, home=slow.get("home", ""),
-                                            away=slow.get("away", ""))
+                                            away=slow.get("away", ""), b365_url=slow.get("b365_url", ""))
                 self._has_open_bet = bool(st.get("open_bet"))
                 self._sync()
 
@@ -2483,6 +2865,10 @@ class ArbitrageBot:
             except (Exception, asyncio.CancelledError):
                 pass
         try:
+            self.pitch.reset()
+        except Exception:
+            pass
+        try:
             await self.alerter.send("🛑 Bot process stopped.")
             await self.alerter.close()
         except Exception:
@@ -2498,11 +2884,11 @@ class ArbitrageBot:
             await self.alerter.send("already running — /stopbot first"); return
         self._active = True
 
-        def on_feed(evt: dict):                  # plain function: one scheduling hop less
+        def on_feed(evt: dict):                  # score feed: keeps the goal count right, CASHES OUT when a score goes down
             if not self._active or not self._slow:
                 return
             if evt.get("event") == "goal":
-                asyncio.ensure_future(self._on_goal(evt))
+                asyncio.ensure_future(self._on_ss_goal(evt))
             elif evt.get("event") == "disallowed":
                 asyncio.ensure_future(self._on_disallowed(evt))
 
@@ -2511,7 +2897,7 @@ class ArbitrageBot:
         self._sync()
         if not quiet:
             await self.alerter.send("BOT STARTED — feed is coming up, list follows.\n"
-                                    "Send /slow with SportyBet- / Bet365- / Home- / Away- lines")
+                                    "Send /slow with SportyBet- / Bet365URL- / Home- / Away- lines")
 
     def _cancel_prep(self):
         if self._prep_task and not self._prep_task.done():
@@ -2522,6 +2908,12 @@ class ArbitrageBot:
         self._rearm_task = None
 
     def _reset_game(self):
+        self.pitch.reset()
+        self._goals, self._score, self._ss_ahead = 0, [0, 0], []
+        self._last_pitch_fire = 0.0
+        self._pitch_bet = True
+        self._side_map = {}
+        self._clock = None
         self._arms = {}
         self._alts = {}
         self._price = {}
@@ -2530,6 +2922,12 @@ class ArbitrageBot:
         self._armed_goal = 0
         self._has_open_bet = False
         self._processing = False
+        self._seen_ids = set()          # goal ids (1003-N) already handled in this match
+        self._gid_of = {}               # goal number -> goal id
+        self._ss_goal_at = {}           # goal number -> when the score feed counted it
+        self._pitch_goal_at = {}        # goal number -> when the goal feed delivered it
+        self._pitch_got = set()         # goal numbers the goal feed delivered
+        self._bets = []                 # bets placed in this match (for cash-out)
 
     async def stop_bot(self):
         self._active = False
@@ -2561,17 +2959,41 @@ class ArbitrageBot:
         await self.alerter.send("Slow cleared")
 
     # ---------- /slow ----------
+    async def _resolve_fi(self, sporty_url: str, home: str, away: str, wait: float = 30.0) -> Optional[str]:
+        """The bet365 fixture id (FI) of this match, found by TEAM NAMES in the score feed - so you never type it.
+        Tries your Home-/Away- names first, then the team names the match page itself reports, then SportyBet's."""
+        end = time.time() + wait
+        while True:
+            pairs: List[Tuple[str, str]] = []
+            if home and away:
+                pairs.append((home, away))
+            t1, t2 = self.pitch.team.get("1", ""), self.pitch.team.get("2", "")
+            if t1 and t2:
+                pairs.append((t1, t2))
+            sbp = _sb_pair_from_url(sporty_url)
+            if sbp[0] and sbp[1]:
+                pairs.append(sbp)
+            for want in pairs:
+                hits = []
+                for fi, st in list(self.bet365.tracker.state.items()):
+                    a, b, _ = _split_teams(st.get("name") or "")
+                    if b and _pair_match((a, b), want) is not None:
+                        hits.append(fi)
+                if len(hits) == 1:
+                    return hits[0]
+            if time.time() >= end:
+                return None
+            await asyncio.sleep(1.0)
+
     async def handle_slow_game(self, sporty_url: str, fi: str, teams: str,
                                feed_wait: Optional[float] = None,
-                               home: str = "", away: str = ""):
+                               home: str = "", away: str = "", b365_url: str = ""):
         """Locks the game IMMEDIATELY and replies, then does the slow work
         (feed baseline, API arming, headless page) in the background."""
         if not self._logged_in:
             await self.alerter.notify_error("login first"); return
         if not self._active:
             await self.alerter.notify_error("send /startbot first"); return
-        if self._warm_testing:
-            await self.alerter.notify_error("warm test is running - wait for its result, then send /slow"); return
 
         m = re.search(r"(sr:match:\d+)", sporty_url or "")
         if not m:
@@ -2585,15 +3007,32 @@ class ArbitrageBot:
         self._reset_game()
         self._arm_ready = asyncio.Event()
 
-        self._slow = {"url": sporty_url, "fi": fi, "event_id": event_id,
+        # the GOAL SIGNAL: open the bet365 match page you pasted (a second tab of the bot's Chrome)
+        if b365_url:
+            self.pitch.open(b365_url, fi)
+        if not fi:
+            fi = await self._resolve_fi(sporty_url, home, away)
+            if not fi:
+                self.pitch.reset()
+                await self.alerter.notify_error(
+                    "Could not find this match in the score feed by team names. "
+                    "Add a line  Bet365- <FI>  (the FI from /matches) and send /slow again.")
+                return
+
+        self._slow = {"url": sporty_url, "fi": fi, "event_id": event_id, "b365_url": b365_url,
                       "teams": teams.strip(), "teams_arg": teams.strip(),
                       "home_arg": home.strip(), "away_arg": away.strip(),
                       "home": "", "away": ""}
-        self.bet365.watch(fi)            # goals are tracked from this moment on
+        self.bet365.watch(fi)            # the score is tracked from this moment on (keeps the count right, cashes out)
+        rec0 = self.bet365.get_match(fi)
+        if rec0:
+            self._goals = rec0["home_score"] + rec0["away_score"]
+            self._score = [rec0["home_score"], rec0["away_score"]]
 
         await self.alerter.send(
             f"🔒 <b>LOCKED</b>  Bet365 FI=<code>{fi}</code>\n{event_id}\n"
-            f"Tracking goals now. Verifying home/away, then preparing SportyBet page + market…")
+            f"Goal feed: opening the bet365 match page…  Score feed tracking FI {fi}.\n"
+            f"Verifying home/away, then preparing SportyBet page + market…")
         self._prep_task = asyncio.create_task(
             self._prepare_slow(sporty_url, fi, event_id, teams, feed_wait))
         self._sync()
@@ -2644,7 +3083,9 @@ class ArbitrageBot:
                     f"Check the number with /matches, then /clear and /slow again.")
                 return
             ss = rec.get("ss") or "0-0"
-            self._next_goal_no = rec["home_score"] + rec["away_score"] + 1
+            self._goals = rec["home_score"] + rec["away_score"]
+            self._score = [rec["home_score"], rec["away_score"]]
+            self._next_goal_no = self._goals + 1
             n365 = rec.get("name") or ""
 
             # 1) WHICH bet365 team is which SportyBet outcome — settled before any goal can fire
@@ -2661,8 +3102,7 @@ class ArbitrageBot:
                 self._slow["teams"] = (f"{user[0]} v {user[1]}" if user
                                        else (teams.strip() or n365))
 
-            # 2) ONE API read gives the half being played AND the markets — capped, so it can
-            #    never hang the bot
+            # 2) ONE API read gives the half being played, the match clock AND the markets — capped
             try:
                 data = await asyncio.wait_for(
                     loop.run_in_executor(self._bg_pool, self.sb.fetch_event, event_id),
@@ -2673,6 +3113,7 @@ class ArbitrageBot:
             phase = _api_phase(data) if data else ""
             if phase in ("1", "2"):
                 self._half = int(phase)
+            self._note_clock(data)
             arms_all = (self.sb.arms_from_data(data, event_id, self._next_goal_no, self._half)
                         if data else {})
             self._set_arms(arms_all)
@@ -2763,7 +3204,6 @@ class ArbitrageBot:
                 self._keep_task = asyncio.create_task(self._keep_loop())
                 self._half_task = asyncio.create_task(self._half_loop())
                 self._price_task = asyncio.create_task(self._price_loop())
-                self._warm_task = asyncio.create_task(self._warm_loop())
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2828,8 +3268,7 @@ class ArbitrageBot:
                 slow = self._slow
                 if not slow or self._processing:
                     continue
-                rec = self.bet365.get_match(slow["fi"])
-                goal_no = (rec["home_score"] + rec["away_score"] + 1) if rec else self._next_goal_no
+                goal_no = self._goals + 1
                 try:
                     data = await asyncio.wait_for(
                         loop.run_in_executor(self._bg_pool, self.sb.fetch_event, slow["event_id"]),
@@ -2862,9 +3301,9 @@ class ArbitrageBot:
             pass
 
     def _refresh_arms(self, data: dict):
-        """Every API poll also refreshes the armed market's probability and odds, so the
-        probability sent with a bet is never older than one poll (it used to stay at the value
-        from the moment the game was locked). A suspended market keeps its last open values."""
+        """Every API poll also refreshes the armed market's probability and odds, so the probability sent
+        with a bet is never older than one poll. A market that is closed for a moment KEEPS its old entry
+        (it is never dropped from the list)."""
         slow = self._slow
         if not slow or self._processing or not self._arms:
             return
@@ -2876,323 +3315,14 @@ class ArbitrageBot:
         fresh = self.sb.arms_from_data(data, slow["event_id"], self._armed_goal, self._half)
         if not fresh:
             return
-        # KEEP_CLOSED: a market that is closed for a moment keeps its old entry. Only markets that are
-        # open right now get fresh odds/probability. A market is never dropped from the list.
         key = lambda a: (a.market_id, a.specifier, a.outcome_id)          # noqa: E731
-        merged = {}
+        merged: Dict[str, List[ArmedSelection]] = {}
         for sd, old_list in self._alts.items():
             newer = {key(a): a for a in fresh.get(sd, [])}
             merged[sd] = [newer.pop(key(a), a) for a in old_list] + list(newer.values())
         for sd, lst in fresh.items():
             merged.setdefault(sd, list(lst))
         self._set_arms(merged)
-
-    async def _timing_probe(self, slow: dict, scoring: str, sb_side: str, label: str,
-                            t0: float, last_open: Optional[float], holder: dict):
-        """Runs right after a bet is dispatched. Watches the SportyBet page cell of the market we
-        bet on for up to 4 s and tells you in Telegram who was first: SportyBet or bet365."""
-        try:
-            ms = lambda t: int((t - t0) * 1000)                     # noqa: E731
-            first = await self.dom.cell_state(label, sb_side)
-            t_base = time.time()
-            changed = None
-            while self._slow is slow and time.time() < t0 + 4.0:
-                await asyncio.sleep(0.04)
-                st = await self.dom.cell_state(label, sb_side)
-                if st is None:
-                    continue
-                if first is None:
-                    first, t_base = st, time.time()
-                    continue
-                if st[0] != first[0]:
-                    changed = (time.time(), first[1], st[1])
-                    break
-            while holder.get("answered_ms") is None and time.time() < t0 + 6.0 and self._slow is slow:
-                await asyncio.sleep(0.1)
-            lo = int((last_open - t0) * 1000) if last_open else None
-            cl = ms(changed[0]) if changed else None
-            ans, dsp = holder.get("answered_ms"), holder.get("dispatched_ms")
-            already = bool(first) and (first[0] == "gone" or first[0].endswith("|nonum"))
-            esc = html.escape
-            lines = [f"🏁 <b>WHO WAS FIRST?</b>  {esc(scoring)}  ({esc(label)})",
-                     "Clock zero = the moment bet365's goal frame reached the bot."]
-            if lo is not None:
-                lines.append(f"SportyBet page last showed an open price {abs(lo)} ms "
-                             f"{'BEFORE' if lo < 0 else 'AFTER'} the goal frame")
-            if first:
-                lines.append(f"Page cell at +{ms(t_base)} ms: {esc(first[1])}")
-            if changed:
-                lines.append(f"Page cell CLOSED/CHANGED at +{cl} ms: {esc(changed[1])} → {esc(changed[2])}")
-            else:
-                lines.append("Page cell did not change within 4 s")
-            lines.append(f"Our order: started +{dsp if dsp is not None else '?'} ms · answered "
-                         f"+{ans if ans is not None else '?'} ms · server code {holder.get('code', '?')}")
-            if already:
-                lines.append(f"➡️ <b>SportyBet FIRST</b>: its market already showed no price when our bet was sent "
-                             f"(+{ms(t_base)} ms).")
-            elif lo is not None and lo < -400:
-                lines.append(f"➡️ <b>SportyBet FIRST</b>: its market stopped showing a price {-lo} ms "
-                             f"before bet365's goal frame reached us.")
-            elif cl is not None:
-                lines.append(f"➡️ <b>bet365 FIRST</b>: the SportyBet page was still open at the goal frame and "
-                             f"closed {cl} ms later. The order has to reach SportyBet before that.")
-            else:
-                lines.append("➡️ Cannot tell: the page cell never changed (it may not show closing). "
-                             "Look at the server code above.")
-            lines.append("(page timing is accurate to about ±100 ms)")
-            await self.alerter.send("\n".join(lines), urgent=True)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"[TIMING] {type(e).__name__}: {e}")
-
-    # ---------- WARM CHANNEL (bet 1 only) ----------
-    def _take_warm(self) -> Optional[dict]:
-        """The pre-opened channel for bet 1 (single use). None = normal fresh path."""
-        if not Config.FAST:
-            return None
-        ch, self._warm = self._warm, None
-        if not ch:
-            return None
-        if time.time() - ch["t"] > Config.WARM_TTL + 2.0:
-            self._close_warm(ch)
-            return None
-        return ch
-
-    @staticmethod
-    def _close_warm(ch: Optional[dict]):
-        try:
-            if ch:
-                ch["c"].close()
-        except Exception:
-            pass
-
-    async def _warm_loop(self):
-        """While a game is locked and fast mode is ON: keeps ONE fresh channel ready, replaced every
-        WARM_TTL seconds and refilled right after it is used."""
-        loop = asyncio.get_running_loop()
-        try:
-            while self._slow:
-                await asyncio.sleep(0.5)
-                if not Config.FAST or not self._slow or self._processing:
-                    continue
-                ch = self._warm
-                if ch and time.time() - ch["t"] < Config.WARM_TTL:
-                    continue
-                try:
-                    new = await asyncio.wait_for(
-                        loop.run_in_executor(self._bg_pool, self.sb.warm_channel), timeout=10)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    new = None
-                if new:
-                    old, self._warm = self._warm, new
-                    self._close_warm(old)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            ch, self._warm = self._warm, None
-            self._close_warm(ch)
-
-    async def set_fast(self, cmd: str):
-        if cmd.endswith(" on"):
-            Config.FAST = True
-        elif cmd.endswith(" off"):
-            Config.FAST = False
-        await self.alerter.send(
-            f"⚡ Fast mode (bet 1 on a channel opened ahead of time): <b>{'ON' if Config.FAST else 'OFF'}</b>\n"
-            f"<code>/fast on</code>  <code>/fast off</code>  <code>/warmtest</code>")
-
-    def _warm_test_sync(self) -> Tuple[List[str], bool]:
-        """Places NO bet: every order is for a made-up match, so the server can read it but never accept it."""
-        sb = self.sb
-        fake = ArmedSelection(event_id="sr:match:1", sport_id="sr:sport:1", market_id="8", outcome_id="6",
-                              specifier="goalnr=1", odds=2.0, probability="0.4", product="1", side="home")
-        order, _ = sb._build_order(fake, 10.0)
-        path = "/api/ng/orders/order"
-        lines: List[str] = []
-        opens: List[float] = []
-        orders: List[float] = []
-        for _ in range(3):
-            c = sb._new_conn()
-            try:
-                t = time.time()
-                aes, tid = sb._open_channel_on(c)
-                a = (time.time() - t) * 1000
-                t = time.time()
-                sb._send_on(c, aes, tid, path, order)
-                b = (time.time() - t) * 1000
-                opens.append(a)
-                orders.append(b)
-            except Exception as e:
-                lines.append(f"timing run failed: {type(e).__name__}: {e}")
-            finally:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-            time.sleep(1.0)
-        if opens:
-            lines.append(f"Normal path: open channel (incl. connect+TLS) {sorted(opens)[len(opens) // 2]:.0f} ms"
-                         f" + order {sorted(orders)[len(orders) // 2]:.0f} ms")
-        ok_at_ttl = False
-        for wait in (Config.WARM_TTL, 20.0, 45.0):
-            c = sb._new_conn()
-            try:
-                aes, tid = sb._open_channel_on(c)
-                time.sleep(wait)
-                alive = sb._alive(c)
-                r = sb._send_on(c, aes, tid, path, order)
-                code = r.get("bizCode", r.get("http", "?"))
-                good = code != 19414
-                lines.append(f"Channel idle {wait:g}s: connection {'open' if alive else 'closed by server'} · "
-                             f"reply {code} -> {'USABLE' if good else 'DEAD'}")
-                if wait == Config.WARM_TTL:
-                    ok_at_ttl = good and alive
-            except Exception as e:
-                lines.append(f"Channel idle {wait:g}s: {type(e).__name__} -> DEAD")
-            finally:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-        return lines, ok_at_ttl
-
-    async def warm_test(self):
-        if not self._logged_in:
-            await self.alerter.notify_error("login first")
-            return
-        if self._slow or self._warm_testing:
-            await self.alerter.send("Send /clear first (no game may be locked) and wait for any running test.")
-            return
-        self._warm_testing = True
-        await self.alerter.send("🧪 Warm-channel test started, about 90 s. It places NO bet: every order is for a made-up match.")
-        try:
-            loop = asyncio.get_running_loop()
-            lines, ok = await asyncio.wait_for(loop.run_in_executor(self._bg_pool, self._warm_test_sync),
-                                               timeout=300)
-            Config.FAST = bool(ok)
-            verdict = ("✅ A channel opened ahead still works after the wait. Fast mode is now ON."
-                       if ok else
-                       "❌ A channel opened ahead does NOT stay usable. Fast mode stays OFF - nothing changes.")
-            await self.alerter.send("🧪 <b>Warm-channel test</b>\n" + "\n".join(html.escape(x) for x in lines)
-                                    + "\n" + verdict)
-        except Exception as e:
-            await self.alerter.notify_error(f"warm test: {type(e).__name__}: {e}")
-        finally:
-            self._warm_testing = False
-
-    async def _timed_send(self, holder: dict, text: str):
-        """Sends the goal alert and remembers when Telegram accepted it."""
-        await self.alerter.send(text, urgent=True)
-        holder["accepted"] = time.time()
-
-    async def _odds_clock(self, slow: dict, scoring: str, mkts: list, t0: float, clock: dict):
-        """After a goal: asks the SportyBet event API every ~0.4 s for up to 5 s and reports, in Nigeria
-        time and in plain words, what SportyBet says about the goal market: its state at the last poll
-        BEFORE the goal, then every change after it (open / SUSPENDED / removed), and the time of its last
-        price change. Runs in the background - it never touches the bet."""
-        loop = asyncio.get_running_loop()
-        prev = getattr(self, "_api_prev", None)
-        if prev and prev["t"] >= t0:
-            prev = None
-        pre_ms = int((t0 - prev["t"]) * 1000) if prev else None
-        track = {}
-        for mid, spec, lab in mkts:
-            before = prev["states"].get((mid, spec), "NOT IN REPLY (removed)") if prev else None
-            track[(mid, spec)] = {"label": lab, "last": None, "closed": None, "n": 0, "tl": [], "cur": None,
-                                  "before": before,
-                                  "seen": bool(prev) and before != "NOT IN REPLY (removed)"}
-        try:
-            while self._slow is slow and time.time() < t0 + 5.0 and any(v["n"] < 2 for v in track.values()):
-                try:
-                    data = await asyncio.wait_for(
-                        loop.run_in_executor(self._bg_pool, self.sb.fetch_event, slow["event_id"]), timeout=3.0)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    data = None
-                now = time.time()
-                if data:
-                    found = {(str(m.get("id") or m.get("marketId") or ""), str(m.get("specifier") or "")): m
-                             for m in self.sb._markets(data)}
-                    for k, v in track.items():
-                        m = found.get(k)
-                        st = _mkt_state(m)
-                        if m is not None:
-                            v["seen"] = True
-                            lc = _to_int(m.get("lastOddsChangeTime"), 0)
-                            if lc:
-                                v["last"] = lc
-                        if st != v["cur"]:
-                            v["tl"].append((int((now - t0) * 1000), st))
-                            v["cur"] = st
-                        if v["seen"] and st != "open":
-                            if v["closed"] is None:
-                                v["closed"] = now
-                            v["n"] += 1
-                await asyncio.sleep(0.3)
-            esc = html.escape
-            out = [f"📡 <b>SPORTYBET CLOCK</b>  {esc(scoring)}",
-                   f"bet365 goal frame received: <b>{_wat(t0)}</b>"]
-            acc = clock.get("accepted")
-            if acc:
-                out.append(f"Telegram accepted our goal alert at: {_wat(acc)} (+{int((acc - t0) * 1000)} ms after the goal frame)")
-            for v in track.values():
-                out.append(f"<b>{esc(v['label'])}</b>")
-                if v["before"] is not None:
-                    out.append(f"  API at the last poll BEFORE the goal ({pre_ms} ms earlier): {esc(v['before'])}")
-                else:
-                    out.append("  no API poll was recorded before the goal")
-                if v["tl"]:
-                    out.append("  API after the goal: " + " → ".join(f"+{ms} ms {esc(st)}" for ms, st in v["tl"]))
-                else:
-                    out.append("  API gave no reply in time after the goal")
-                if v["last"]:
-                    d = int(v["last"] - t0 * 1000)
-                    out.append(f"  SportyBet last changed this price at <b>{_wat(v['last'] / 1000)}</b> -> "
-                               f"{abs(d)} ms {'AFTER' if d >= 0 else 'BEFORE'} our goal frame")
-                if v["before"] is not None and v["before"] != "open":
-                    out.append(f"  ➡️ <b>SportyBet FIRST</b>: at the last poll before the goal ({pre_ms} ms earlier) "
-                               f"the market was already {esc(v['before'])}.")
-                elif v["closed"]:
-                    out.append(f"  ➡️ open at the last poll before the goal, first seen not open +{int((v['closed'] - t0) * 1000)} ms "
-                               f"after our goal frame (the real closing is somewhere in between).")
-                elif v["seen"]:
-                    out.append("  ➡️ still OPEN 5 s after our goal frame")
-                else:
-                    out.append("  ➡️ market not found in the API reply")
-            out.append("Polls before the goal are about 2 s apart, after the goal about 0.4 s. lastOddsChangeTime is "
-                       "when SportyBet last MOVED the price, not when it closed the market.")
-            await self.alerter.send("\n".join(out))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"[CLOCK] {type(e).__name__}: {e}")
-
-    async def _no_price_note(self, sb_side: str, p, t0: float) -> str:
-        """Why there was no page price: when the page last showed one, and what the page lists now."""
-        try:
-            if p:
-                d = int((p[2] - t0) * 1000)
-                age = (f"SportyBet page last showed a price for {sb_side.upper()} {abs(d)} ms "
-                       f"{'AFTER' if d > 0 else 'BEFORE'} the goal frame ({p[1]})")
-            else:
-                age = f"the page never showed a price for {sb_side.upper()} since this game was locked"
-            hdrs = (await self.dom.headers())[:12]
-            return f"\n{age}\nPage titles now: " + (" · ".join(hdrs) if hdrs else "none")
-        except Exception:
-            return ""
-
-    def _note_api(self, data: dict):
-        """Remembers the state of every next-goal market at this API poll, so a goal can be compared with it."""
-        try:
-            self._api_prev = {"t": time.time(),
-                              "states": {(str(m.get("id") or m.get("marketId") or ""), str(m.get("specifier") or "")): _mkt_state(m)
-                                         for m in self.sb._markets(data)}}
-        except Exception:
-            pass
 
     # ---------- page price: the ONLY odds source for a bet ----------
     def _on_price(self, side: str, odds: float, label: str):
@@ -3223,30 +3353,218 @@ class ArbitrageBot:
                     await self.dom.watch(lh, la)
                 res = await self.dom.odds_pair(lh, la)
                 now = time.time()
+                _trk_market(res, now)
                 for sd, det in zip(("home", "away"), res):
                     if det and det[0] > 1.01:
                         self._price[sd] = (det[0], det[1], now)
         except asyncio.CancelledError:
             pass
 
+    # ---------- GOAL SIGNAL (bet365 match page) = bets. The score feed (SS) only keeps the count right and cashes out. ----------
+    def _note_clock(self, data: Any):
+        c = _api_clock(data)
+        if c is not None:
+            self._clock = (c, time.time())
+
+    def _now_minute(self) -> Optional[float]:
+        if not self._clock:
+            return None
+        m, t = self._clock
+        el = time.time() - t
+        return None if el > 180 else m + el / 60.0
+
+    def _minute_fresh(self, minute: int) -> bool:
+        """A goal of this match minute is recent (not old history replayed late). Unknown clock = accept."""
+        nm = self._now_minute()
+        return True if nm is None else minute >= nm - Config.PITCH_FRESH_MINUTES
+
+    def _on_pitch_event(self, e: dict):
+        if e.get("kind") == "goal":
+            asyncio.ensure_future(self._pitch_goal(e))
+
+    def _pitch_side(self, tid: str, slow: dict) -> str:
+        """bet365 score slot ('home' = first-listed team) of the team that scored: by team NAME when the feed
+        gives the names, else by team id (1 = home, 2 = away)."""
+        sd = self._side_map.get(tid)
+        if sd:
+            return sd
+        nm = self.pitch.team.get(tid, "")
+        first, second = slow.get("t365") or ("", "")
+        if nm and first and second:
+            a, b = _sim(nm, first), _sim(nm, second)
+            if a >= b + 0.25 and a >= 0.5:
+                sd = "home"
+            elif b >= a + 0.25 and b >= 0.5:
+                sd = "away"
+            if sd:
+                self._side_map[tid] = sd
+                return sd
+        return {"1": "home", "2": "away"}.get(tid, "")
+
+    async def _pitch_goal(self, e: dict):
+        """A goal record from the match page. Memory only - nothing here waits for any request.
+        replay -> skip | already counted by the score feed -> old | the NEXT goal -> LIVE, even when it arrives
+        inside a history window (a replay can never be the next goal: the score feed already counts every played goal)."""
+        slow = self._slow
+        p = self.pitch
+        if not slow or not self._active:
+            return
+        now = float(e["ts"])
+        n, gid = e.get("n"), str(e.get("gid") or "")
+
+        def note(what: str):
+            line = f"{time.strftime('%H:%M:%S')} {gid or '?'} {e.get('minute') or '?'}' team {e.get('tid') or '?'} -> {what}"
+            p.log.append(line)
+            _plog("DECISION " + line)
+
+        if n is None:
+            note("no goal number in the record - NOT betting")
+            await self.alerter.send(
+                f"🎬 goal record without a goal number - NOT betting\nRAW: {html.escape(str(e.get('raw')))[:300]}",
+                urgent=True)
+            return
+        goal_no = int(n) + 1
+        self._pitch_got.add(goal_no)
+        side = self._pitch_side(e.get("tid", ""), slow)
+        rec = self.bet365.get_match(slow["fi"])
+        ss_tot = (rec["home_score"] + rec["away_score"]) if rec else None
+        known = max(self._goals, ss_tot or 0)                    # goals the bot / the score feed already count
+        t_ss = self._ss_goal_at.get(goal_no)
+        ss_just_ahead = t_ss is not None and now - t_ss <= Config.SS_AHEAD_SECS
+
+        if gid in self._seen_ids:                                 # 1) replay of a goal we already handled
+            p.dupes += 1
+            note("replay (id already seen)")
+            return
+        if e.get("hist"):                                         # 2) inside a history window
+            is_next = ss_tot is not None and goal_no == known + 1
+            if not (is_next or ss_just_ahead):
+                self._seen_ids.add(gid)
+                p.ignored += 1
+                if goal_no > known:                               # a goal nobody counted and not the next one: do not bet, say so
+                    self._goals = goal_no
+                    self._next_goal_no = goal_no + 1
+                    self._rearm_task = asyncio.create_task(self._rearm(quiet=True))
+                    note(f"history shows goal #{goal_no} but the score feed counts {known} - NOT betting")
+                    await self.alerter.send(
+                        f"⚠️ history shows goal #{goal_no} ({e.get('minute') or '?'}') but the score feed counts {known}. "
+                        f"NOT betting. Check the match.", urgent=True)
+                else:
+                    note(f"history - old goal #{goal_no} (already counted: {known})")
+                return
+            note(f"inside the history window but goal #{goal_no} is the NEXT goal (counted: {known}) - treating as LIVE")
+        elif goal_no <= known and not ss_just_ahead:              # 3) already counted
+            self._seen_ids.add(gid)
+            p.ignored += 1
+            note(f"already counted (goal #{goal_no} <= {known})")
+            return
+        # 4) LIVE goal
+        self._seen_ids.add(gid)
+        self._gid_of[goal_no] = gid
+        h, a = self._score
+        prev = f"{h}-{a}"
+        gap = goal_no > known + 1
+        if goal_no > self._goals:
+            self._goals = goal_no
+            if side == "home":
+                h += 1
+            elif side == "away":
+                a += 1
+            miss = self._goals - (h + a)
+            if miss > 0 and side in ("home", "away"):
+                if side == "home":
+                    h += miss
+                else:
+                    a += miss
+            self._score = [h, a]
+            asyncio.create_task(self._later(Config.CONFIRM_SECS, self._check_confirm(slow, goal_no, gid)))
+        self._pitch_goal_at[goal_no] = now
+        self._last_pitch_fire = now
+        p.fired += 1
+        note(f"LIVE goal #{goal_no}" + (" (a goal number was skipped!)" if gap else ""))
+        if side not in ("home", "away") or not self._pitch_bet:
+            why = "the team is unclear" if side not in ("home", "away") else "betting from the goal feed is OFF (/pitch on)"
+            await self.alerter.send(
+                f"🎬 NEW GOAL #{goal_no} {e.get('minute') or ''}' - NOT betting: {why}\n"
+                f"RAW: {html.escape(str(e.get('raw')))[:300]}", urgent=True)
+            return
+        await self._on_goal({
+            "event": "goal", "src": "pitch", "match_id": slow["fi"], "scorer": side, "ts": now,
+            "name": f"{slow['teams']}  🎬 pitch {e.get('minute') or ''}'" + ("  ⚠️ goal number skipped" if gap else ""),
+            "prev_ss": prev, "ss": f"{h}-{a}", "home_score": h, "away_score": a,
+            "goal_no": goal_no, "goals_added": 1})
+
+    async def _on_ss_goal(self, evt: dict):
+        """The score feed counted a goal. It NEVER bets. It keeps the count right, confirms a pitch goal AFTER the bet,
+        and warns when the goal feed missed a goal."""
+        slow = self._slow
+        if not slow or str(evt.get("match_id")) != str(slow["fi"]):
+            return
+        h, a = int(evt.get("home_score") or 0), int(evt.get("away_score") or 0)
+        tot = h + a
+        ts = float(evt.get("ts") or time.time())
+        self._ss_goal_at[tot] = ts
+        pt = self._pitch_goal_at.get(tot)
+        if tot > self._goals:
+            self._goals, self._score = tot, [h, a]
+            self._next_goal_no = tot + 1
+            self._rearm_task = asyncio.create_task(self._rearm())
+            asyncio.create_task(self.alerter.send(
+                f"🥅 <b>SCORE FEED goal #{tot}</b>  {html.escape(str(evt.get('name') or slow['teams']))}\n"
+                f"⚽ {evt.get('prev_ss')} → {evt.get('ss')}  🕐 {_wat(ts)}\n"
+                f"(information only - bets come from the goal feed)", urgent=True))
+            asyncio.create_task(self._later(Config.MISSED_GOAL_SECS, self._check_missed(slow, tot)))
+        elif tot == self._goals:
+            if pt is not None:
+                d = ts - pt
+                how = f"goal feed {abs(d):.1f}s {'AHEAD of' if d >= 0 else 'BEHIND'} the score feed"
+            else:
+                how = "goal came from history"
+            asyncio.create_task(self.alerter.send(f"✅ score feed confirms goal #{tot}  ({how})", urgent=True))
+            _plog(f"SS confirms goal #{tot}: {how}")
+
+    def _reconcile_goals(self):
+        """Replaced by _check_confirm (40 s after a pitch goal the score feed must have confirmed it)."""
+        return
+
+    async def pitch_cmd(self, low: str):
+        if low.endswith(" on"):
+            self._pitch_bet = True
+        elif low.endswith(" off"):
+            self._pitch_bet = False
+        p = self.pitch
+        age = f"{int(time.time() - p.last_frame_at)} s ago" if p.last_frame_at else "never"
+        nm = self._now_minute()
+        await self.alerter.send(
+            "🎬 <b>Goal feed</b>\n"
+            f"match page: {html.escape(p.url or '-')}\nEV: {p.ev or '-'} · state: {html.escape(p.state)}\n"
+            f"frames: {p.frames} · last frame: {age} · match clock: {('%.0f min' % nm) if nm is not None else 'unknown'}\n"
+            f"goals fired: {p.fired} · history/old ignored: {p.ignored} · duplicates ignored: {p.dupes}\n"
+            f"goal count: {self._goals}  (score feed {self._score[0]}-{self._score[1]})\n"
+            f"betting from the goal feed: <b>{'ON' if self._pitch_bet else 'OFF'}</b>\n"
+            + ("<b>last decisions</b>\n" + "\n".join(html.escape(x) for x in p.log) if p.log else "no goal records yet"))
+
+    async def _no_price_note(self, sb_side: str, p, t0: float) -> str:
+        """Why there was no page price: when the page last showed one, and what the page lists now."""
+        try:
+            if p:
+                d = int((p[2] - t0) * 1000)
+                age = (f"SportyBet page last showed a price for {sb_side.upper()} {abs(d)} ms "
+                       f"{'AFTER' if d > 0 else 'BEFORE'} the goal signal ({p[1]})")
+            else:
+                age = f"the page never showed a price for {sb_side.upper()} since this game was locked"
+            hdrs = (await self.dom.headers())[:12]
+            return f"\n{age}\nPage titles now: " + (" · ".join(hdrs) if hdrs else "none")
+        except Exception:
+            return ""
+
     # ---------- goal ----------
     def _place_timed(self, arm: ArmedSelection, stake: float, odds: float,
-                     t_dispatch: float, warm: Optional[dict] = None) -> dict:
+                     t_dispatch: float) -> dict:
         """Runs in a bet thread. Fresh connection + fresh channel (see place_fresh).
         Adds timestamps so the Telegram timing line shows where time went."""
         t_a = time.time()
-        r = None
-        route = "fresh channel"
-        if warm is not None:
-            r = self.sb.place_warm(warm, arm, stake, odds)
-            if r.get("_unread"):
-                route = f"fresh channel (warm one unusable: {r.get('bizCode')} {str(r.get('message', ''))[:40]})"
-                r = None
-            else:
-                route = f"WARM channel (opened {int((t_a - warm['t']) * 1000)}ms earlier)"
-        if r is None:
-            r = self.sb.place_fresh(arm, stake, odds)
-        r["_route"] = route
+        r = self.sb.place_fresh(arm, stake, odds)
         r["_t_d"], r["_t_a"], r["_t_b"] = t_dispatch, t_a, time.time()
         return r
 
@@ -3258,14 +3576,12 @@ class ArbitrageBot:
         first, second = slow.get("t365") or ("", "")
         scoring = (first if side == "home" else second) or side
 
-        # ---- the GOAL SIGNAL goes to Telegram, whatever happens to the bet afterwards
-        clock: dict = {}
-        asyncio.create_task(self._timed_send(clock,
+        # ---- the GOAL ALERT goes to Telegram, whatever happens to the bet afterwards
+        asyncio.create_task(self.alerter.send(
             f"🎯 <b>GOAL</b>  FI=<code>{slow['fi']}</code>  "
             f"{html.escape(evt.get('name') or slow['teams'])}\n"
             f"⚽ {html.escape(scoring)}  {evt.get('prev_ss')} → {evt.get('ss')}\n"
-            f"🕐 goal frame received <b>{_wat(evt.get('ts'))}</b> "
-            f"(alert queued +{int((time.time() - float(evt.get('ts') or time.time())) * 1000)} ms)"))
+            f"🕐 signal received <b>{_wat(evt.get('ts'))}</b>", urgent=True))
 
         if side not in ("home", "away"):
             await self.alerter.notify_error(f"goal scorer unclear: {evt}"); return
@@ -3280,7 +3596,7 @@ class ArbitrageBot:
 
         self._processing = True
         seq_started = False                               # the bet sequence owns _processing once it starts
-        t0 = float(evt.get("ts") or time.time())          # the moment the feed saw the goal
+        t0 = float(evt.get("ts") or time.time())          # the moment the signal arrived
         t_in = time.time()                                # the moment this handler started
         try:
             if not self._arm_ready.is_set():
@@ -3319,18 +3635,17 @@ class ArbitrageBot:
             # ---- cache, so reading it is a dictionary lookup (microseconds) — nothing is awaited.
             # ---- If the cache is empty, ONE page read with a hard time limit.
             # ---- No page price = no bet (never the API price).
-            asyncio.create_task(self._odds_clock(
-                slow, scoring, [(c.market_id, c.specifier, (c.dom_labels or [c.market_name])[0])
-                                for c in cands[:2]], t0, clock))
             labels, owner = self._labels(cands)
             p = self._price.get(sb_side)
             if p and time.time() - p[2] <= Config.PRICE_MAX_AGE and _label_key(p[1]) in owner:
                 det: Optional[Tuple[float, str]] = (p[0], p[1])
-                from_cache = True
             else:
-                from_cache = False
                 det = await self.dom.odds_detail(labels, sb_side, Config.PAGE_TIMEOUT)
             if not det or det[0] <= 1.01:
+                try:
+                    _dlog(f"NO_PRICE side={sb_side} signal_age={(time.time() - t0) * 1000:.0f}ms")
+                except Exception:
+                    pass
                 blk = await self.dom.probe(labels)           # what the page block really holds
                 await self.alerter.notify_error(
                     f"no price on the SportyBet page for {sb_side.upper()} "
@@ -3341,10 +3656,6 @@ class ArbitrageBot:
             odds, page_label = det
             arm = owner.get(_label_key(page_label)) or cands[0]
             t_px = time.time()
-            px_note = (f"price from cache (page last read {int((t_px - p[2]) * 1000)}ms before the goal)"
-                       if from_cache else "price read live from the page")
-            holder: dict = {}
-            last_open = p[2] if (p and _label_key(p[1]) in owner) else None
 
             # ---- BET 1: dispatched right now on its own thread, fresh connection + fresh channel.
             tracked = self.balance > 0
@@ -3355,9 +3666,12 @@ class ArbitrageBot:
                     f"balance ₦{bal:,.2f} is too low for a bet (minimum ₦10) — NOT betting")
                 return
             loop = asyncio.get_running_loop()
-            warm = self._take_warm()
-            fut1 = loop.run_in_executor(self._bet_pool, self._place_timed, arm, stake, odds, time.time(), warm)
+            fut1 = loop.run_in_executor(self._bet_pool, self._place_timed, arm, stake, odds, time.time())
             t_sent = time.time()
+            try:
+                _dlog(f"BET_DISPATCH signal_to_dispatch={(t_sent - t0) * 1000:.0f}ms side={sb_side} odds={odds}")
+            except Exception:
+                pass
             asyncio.create_task(self.alerter.send(          # bet alert in the BACKGROUND
                 f"💸 SportyBet <b>{sb_side.upper()}</b>  {html.escape(page_label)} @ {odds}  "
                 f"stake ₦{stake:,.2f}  profit ₦{stake * (odds - 1):,.2f}  cap ₦{Config.MAX_PROFIT_PER_BET:,.0f}",
@@ -3368,8 +3682,7 @@ class ArbitrageBot:
             # ---- the rebet + the answers are handled by the sequence, in the background
             seq_started = True
             asyncio.create_task(self._bet_sequence(slow, arm, scoring, page_label, odds, stake,
-                                                   fut1, tracked, (t0, t_in, t_px, t_sent, px_note, holder)))
-            asyncio.create_task(self._timing_probe(slow, scoring, sb_side, page_label, t0, last_open, holder))
+                                                   fut1, tracked, (t0, t_in, t_px, t_sent)))
         except Exception as e:
             logger.exception("goal handler failed")
             await self.alerter.notify_error(f"goal handler: {e}")
@@ -3385,9 +3698,9 @@ class ArbitrageBot:
 
     async def _bet_sequence(self, slow: dict, arm: ArmedSelection, scoring: str, label: str,
                             odds: float, stake: float, fut1: Any, tracked: bool, marks: tuple):
-        """Bet 1 is already on its way. The rebet is the SAME request, sent only after bet 1 was
-        ANSWERED plus REBET_GAP — the server never has two orders of this account in flight, so no
-        19004 'already being processed'. Every order uses its own fresh connection + channel."""
+        """Bet 1 is already on its way. The rebet is sent only after bet 1 was ANSWERED, at most REBET_GAP (0.25 s)
+        later, and its stake comes from the real balance. A 4200 (balance) reply carries the real balance: the order is
+        then sent once more with a stake that fits. Any other rejection is NOT rebet."""
         loop = asyncio.get_running_loop()
         plan: List[Tuple[float, float]] = [(odds, stake)]
         futs: List[Any] = [fut1]
@@ -3414,16 +3727,33 @@ class ArbitrageBot:
                 if last is None:
                     notes.append(f"rebet skipped: bet {n} not answered within {Config.BET_WAIT:g}s")
                     break
-                if last.get("bizCode") == 4510:
+                code = last.get("bizCode")
+                if code == 4200:                                     # not enough balance: the reply has the real one
+                    real = _units_balance(last)
+                    if real is None:
+                        notes.append("no resend: 4200 without a balance in the reply")
+                        break
+                    self.balance, tracked = real, True
+                    credited.add(len(plan) - 1)
+                    notes.append(f"4200: real balance ₦{real:,.2f} - resending once with a stake that fits")
+                elif code == 4510:
                     fx = _fix_from_4510(last)
                     if not fx:
                         notes.append("rebet skipped: 4510 (market / odds changed)")
                         break
                     arm = replace(arm, probability=fx)
                     notes.append(f"rebet uses the server's current probability {fx}")
-                if self._slow is not slow:
+                elif code != 10000:
+                    notes.append(f"no rebet: bet {n} was rejected ({_brief(last)[:90]})")
                     break
-                await asyncio.sleep(Config.REBET_GAP)
+                else:                                                # bet 1 accepted: read the real balance DURING the gap
+                    bal_f = loop.run_in_executor(self._bg_pool, self.sb.get_balance)
+                    try:
+                        fresh = await asyncio.wait_for(asyncio.shield(bal_f), timeout=Config.REBET_GAP)
+                    except Exception:
+                        fresh = None                                 # not back within the gap: use the tracked balance
+                    if fresh is not None:
+                        self.balance, tracked = fresh, True
                 if self._slow is not slow:
                     break
                 if tracked and self.balance < 10.0:
@@ -3447,13 +3777,18 @@ class ArbitrageBot:
 
         raw = await asyncio.gather(*futs, return_exceptions=True)
         self._processing = False                 # all answers are in: the bot is free for the next goal
+        try:
+            self._remember_bets(slow, [r for r in raw if isinstance(r, dict)])
+        except Exception as e:
+            logger.error(f"remember bets: {e!r}")
         await self._report_bets(slow, scoring, plan, raw, tracked, label, notes, marks, credited)
+        asyncio.create_task(self._refresh_balance_once())
 
     async def _report_bets(self, slow: dict, scoring: str, plan: list, raw: list,
                            tracked: bool, label: str, notes: list, marks: tuple, credited: set):
         """Reports the order answers. A failed bet gets the full server reply and the exact
         request, so it can be diagnosed."""
-        t0, t_in, t_px, t_sent, px_note, holder = marks
+        t0, t_in, t_px, t_sent = marks
         try:
             results = [r if isinstance(r, dict) else
                        {"bizCode": -2, "message": f"{type(r).__name__}: {r}"} for r in raw]
@@ -3467,16 +3802,12 @@ class ArbitrageBot:
                 slow["teams"], scoring, plan[0][1], plan[0][0], len(good), len(results)))
             ms = lambda a, b: int((b - a) * 1000)            # noqa: E731
             r0 = results[0]
-            if str(r0.get("_route", "")).startswith("WARM") and r0.get("bizCode") not in (10000, 4510):
-                Config.FAST = False
-                asyncio.create_task(self.alerter.send(
-                    f"⚠️ Warm channel answered code {r0.get('bizCode')} - fast mode switched OFF automatically.",
-                    urgent=True))
-            holder["answered_ms"] = ms(t0, r0["_t_b"]) if "_t_b" in r0 else None
-            holder["dispatched_ms"] = ms(t0, r0["_t_a"]) if "_t_a" in r0 else None
-            holder["code"] = r0.get("bizCode")
-            parts = [f"feed→handler {ms(t0, t_in)}ms", f"page price {ms(t_in, t_px)}ms",
-                     f"feed→1st bet dispatched {ms(t0, t_sent)}ms", px_note]
+            try:
+                _dlog(f"BET_RESULT codes={[r.get('bizCode') for r in results]} order_round_trip_ms={int((r0['_t_b'] - r0['_t_a']) * 1000) if '_t_b' in r0 else None}")
+            except Exception:
+                pass
+            parts = [f"signal→handler {ms(t0, t_in)}ms", f"page price {ms(t_in, t_px)}ms",
+                     f"signal→1st bet dispatched {ms(t0, t_sent)}ms"]
             if "_t_a" in r0:
                 parts += [f"thread wait {ms(r0['_t_d'], r0['_t_a'])}ms",
                           f"bet 1 round trip (new connection) {ms(r0['_t_a'], r0['_t_b'])}ms"]
@@ -3485,7 +3816,7 @@ class ArbitrageBot:
             parts.append(f"all done {ms(t0, time.time())}ms")
             if tracked:
                 parts.append(f"balance ₦{self.balance:,.2f}")
-            timing = "⏱ " + " · ".join(parts + ([f"order path: {r0.get('_route')}"] if r0.get("_route") else []) + notes)
+            timing = "⏱ " + " · ".join(parts + notes)
             for i, r in enumerate(results):
                 if r.get("bizCode") == 10000:
                     continue
@@ -3499,7 +3830,6 @@ class ArbitrageBot:
                     f"{html.escape(label)} @ {o} · stake ₦{st:,.2f} · profit ₦{st * (o - 1):,.2f} "
                     f"· SportyBet took {took}\n"
                     f"why: {html.escape(_brief(r))}\n"
-                    f"{html.escape(_clock_line(r, t0))}\n"
                     f"{html.escape(_diag_4510(r))}\n"
                     f"<pre>{html.escape(body[:2600], quote=False)}</pre>", urgent=True))
             asyncio.create_task(self.alerter.send(timing, urgent=True))
@@ -3508,38 +3838,37 @@ class ArbitrageBot:
             logger.exception("report_bets failed")
             await self.alerter.notify_error(f"bet result: {type(e).__name__}: {e}")
 
-    # ---------- disallowed ----------
+    # ---------- disallowed: the SCORE feed went DOWN -> cash out from SportyBet ----------
     async def _on_disallowed(self, evt: dict):
+        """The SCORE feed went DOWN: forget that goal, then cash out the bets placed on it - but only when the market
+        they were placed on is open again on SportyBet (polled through the SportyBet API)."""
         if not self._slow or str(evt.get("match_id")) != str(self._slow["fi"]):
             return
+        try:
+            ph, pa = [int(x) for x in str(evt.get("prev_ss")).split("-")]
+        except Exception:
+            ph, pa = 0, 0
+        prev_total = ph + pa
+        h, a = int(evt.get("home_score") or 0), int(evt.get("away_score") or 0)
+        pending = [b for b in self._bets if b.get("goal_no") in (prev_total, None)]
         await self.alerter.send(
             f"🚫 GOAL CANCELLED  FI=<code>{self._slow['fi']}</code>  "
             f"{html.escape(evt.get('name') or self._slow['teams'])}  "
             f"{evt.get('prev_ss')} → {evt.get('ss')}"
-            + ("\nCashing out all open bets…" if self._has_open_bet else ""), urgent=True)
-        if self._has_open_bet:
-            try:
-                loop = asyncio.get_running_loop()
-                tot_ok, last_fail, notes = 0, 0, []
-                for attempt in range(3):          # a cash-out offer can take a moment to appear
-                    ok, fail, notes = await loop.run_in_executor(self._bg_pool, self.sb.cashout_all)
-                    tot_ok += ok
-                    last_fail = fail
-                    if fail == 0:
-                        break
-                    await asyncio.sleep(1.5)
-                msg = f"CASHOUT ok={tot_ok} fail={last_fail}"
-                if last_fail and notes:
-                    msg += "\n" + "\n".join(html.escape(n)[:300] for n in notes[:6])
-                await self.alerter.send(msg, urgent=True)
-                if last_fail == 0:
-                    self._has_open_bet = False
-            except Exception as e:
-                await self.alerter.notify_error(f"cashout: {e}")
-        # stays on this game; the goal count went back, so re-arm that goal number
+            + (f"\nWaiting for the market to open again, then cashing out {len(pending)} bet(s)…" if pending else ""),
+            urgent=True)
+        gid = self._gid_of.pop(prev_total, None)               # the cancelled goal is forgotten, so a real goal can reuse its number
+        for g in (gid, f"1003-{prev_total - 1}"):
+            if g:
+                self._seen_ids.discard(g)
+        self._pitch_got.discard(prev_total)
+        self._ss_goal_at.pop(prev_total, None)
+        self._pitch_goal_at.pop(prev_total, None)
+        self._goals, self._score, self._ss_ahead = h + a, [h, a], []
+        self._next_goal_no = self._goals + 1
+        if pending:
+            self._cash_task = asyncio.create_task(self._cashout_when_open(pending))
         try:
-            self._next_goal_no = (int(evt.get("home_score") or 0)
-                                  + int(evt.get("away_score") or 0) + 1)
             await self._rearm()
         except Exception as e:
             logger.error(f"rearm after cancel: {e!r}")
@@ -3553,8 +3882,7 @@ class ArbitrageBot:
         slow = self._slow
         if not slow:
             return False
-        rec = self.bet365.get_match(slow["fi"])
-        goal_no = (rec["home_score"] + rec["away_score"] + 1) if rec else self._next_goal_no
+        goal_no = self._goals + 1
         arms_all = self.sb.arms_from_data(data, slow["event_id"], goal_no, 2)
         if not arms_all:
             return False
@@ -3575,15 +3903,17 @@ class ArbitrageBot:
         return True
 
     async def _half_loop(self):
-        """Every HALF_POLL seconds (default 2) asks the SportyBet event API which part of the
-        match it is (1st half / half time / 2nd half / full time). It tells you on Telegram at
-        half time and full time, and the moment the 2nd half is confirmed it switches the armed
-        market from the 1st-half next goal to the full-time next goal. The API is the ONLY
-        source for the half — the page is never used for it."""
+        """Every HALF_POLL seconds asks the SportyBet event API which part of the match it is and what the clock says.
+        Tells you at half time, CLEARS THE GAME AUTOMATICALLY at full time (explicit FT from the API, or the API going
+        silent / having no open next-goal market for minutes after minute 85), and switches the armed market to the
+        full-time next goal the moment the 2nd half is confirmed."""
         loop = asyncio.get_running_loop()
         last, same, notified = "", 0, ""
         unknown = misses = 0
         warned_unknown = warned_miss = False
+        no_data_since: Optional[float] = None
+        no_mkt_since: Optional[float] = None
+        last_dump = 0.0
         try:
             while self._slow:
                 await asyncio.sleep(Config.HALF_POLL)
@@ -3600,10 +3930,26 @@ class ArbitrageBot:
                     logger.warning(f"[HALF] {type(e).__name__}: {e}")
                     continue
                 if not data:
+                    no_data_since = no_data_since or time.time()
+                    if self._ft_guess(no_data_since, Config.FT_SILENCE_SECS):
+                        await self._ft_clear(slow, "the SportyBet API returned nothing after minute 85", None)
+                        return
                     continue
+                no_data_since = None
+                self._note_clock(data)
+                if self._clock and self._clock[0] >= 85.0 and time.time() - last_dump >= 60:
+                    last_dump = time.time()
+                    _plog("API fields after minute 85: " + _api_fields(data)[:800])
                 self._refresh_arms(data)
-                self._note_api(data)
-                phase = _api_phase(data)
+                self._reconcile_goals()
+                if self.sb.arms_from_data(data, slow["event_id"]):
+                    no_mkt_since = None
+                else:
+                    no_mkt_since = no_mkt_since or time.time()
+                    if self._ft_guess(no_mkt_since, Config.FT_NOMARKET_SECS):
+                        await self._ft_clear(slow, "no open next-goal market for minutes after minute 85", data)
+                        return
+                phase = "FT" if _api_ended(data) else _api_phase(data)
                 if not phase:
                     unknown += 1
                     if unknown >= 10 and not warned_unknown:
@@ -3618,13 +3964,16 @@ class ArbitrageBot:
                 last = phase
                 if same < 2:                         # same answer twice in a row = confirmed
                     continue
-                if phase in ("HT", "FT"):            # tell the user once per break
+                if phase in ("HT", "FT"):
                     if phase != notified:
                         notified = phase
                         label = "HALF TIME" if phase == "HT" else "FULL TIME"
-                        extra = "" if phase == "HT" else "\nSend /slow for another game."
+                        extra = "" if phase == "HT" else "\nClearing this game automatically."
                         await self.alerter.send(
                             f"⏸ <b>{label}</b> — {html.escape(slow['teams'] or '?')}{extra}")
+                        if phase == "FT":
+                            asyncio.ensure_future(self._auto_clear())
+                            return
                     continue
                 notified = ""
                 if int(phase) >= (self._half or 0):
@@ -3641,13 +3990,16 @@ class ArbitrageBot:
                             warned_miss = True
                             await self.alerter.send(
                                 f"⚠️ 2nd half detected but no open next-goal market for goal "
-                                f"#{self._next_goal_no} yet — still retrying every {Config.HALF_POLL:g}s")
+                                f"#{self._goals + 1} yet — still retrying every {Config.HALF_POLL:g}s")
         except asyncio.CancelledError:
             pass
 
     # ---------- housekeeping while a game is locked ----------
     async def _keep_loop(self):
-        """Brings the headless SportyBet page back if it dies or shows no markets."""
+        """Brings the headless SportyBet page back if it dies or shows no markets. Also starts the balance reader."""
+        bt = getattr(self, "_balance_task", None)
+        if not (bt and not bt.done()):
+            self._balance_task = asyncio.create_task(self._balance_loop())
         empty = 0
         try:
             while self._slow:
@@ -3663,7 +4015,7 @@ class ArbitrageBot:
                         empty = 0
                     elif await self.dom.market_count() == 0:
                         empty += 1
-                        if empty >= 3:
+                        if empty >= 3:                      # ~15 s with no market tables: reload the page
                             empty = 0
                             await self.dom.reload()
                             logger.warning("[KEEP] page had no markets - reloaded")
@@ -3677,7 +4029,7 @@ class ArbitrageBot:
             pass
 
     async def _stop_tasks(self):
-        for attr in ("_keep_task", "_half_task", "_price_task", "_arm_task", "_warm_task"):
+        for attr in ("_keep_task", "_half_task", "_price_task", "_arm_task", "_balance_task"):
             t = getattr(self, attr, None)
             if t and not t.done():
                 t.cancel()
@@ -3691,6 +4043,134 @@ class ArbitrageBot:
         self._active = False
         self.bet365._want_run = False
         self.bet365.running = False
+
+    async def _later(self, delay: float, coro) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await coro
+        except asyncio.CancelledError:
+            coro.close()
+        except Exception as e:
+            logger.error(f"[LATER] {e!r}")
+
+    async def _check_missed(self, slow: dict, goal_no: int):
+        """The score feed counted a goal. If the goal feed never delivered it, say so."""
+        if slow is not self._slow or goal_no in self._pitch_got:
+            return
+        _plog(f"MISSED goal #{goal_no}: the score feed counted it, the goal feed never delivered it")
+        await self.alerter.send(
+            f"⚠️ goal feed MISSED goal #{goal_no} (the score feed counted it). No bet was placed on it.", urgent=True)
+
+    async def _check_confirm(self, slow: dict, goal_no: int, gid: str):
+        """A pitch goal the score feed has still not confirmed after CONFIRM_SECS: warn and take it back."""
+        if slow is not self._slow:
+            return
+        rec = self.bet365.get_match(slow["fi"])
+        tot = (rec["home_score"] + rec["away_score"]) if rec else 0
+        if tot >= goal_no or self._goals != goal_no:
+            return
+        self._goals = tot
+        if rec:
+            self._score = [rec["home_score"], rec["away_score"]]
+        self._seen_ids.discard(gid)
+        self._pitch_got.discard(goal_no)
+        self._pitch_goal_at.pop(goal_no, None)
+        self._next_goal_no = tot + 1
+        self._rearm_task = asyncio.create_task(self._rearm(quiet=True))
+        _plog(f"UNCONFIRMED goal #{goal_no} ({gid}): score feed still at {tot} after {Config.CONFIRM_SECS:g}s")
+        await self.alerter.send(
+            f"⚠️ pitch goal #{goal_no} NOT confirmed by the score feed after {Config.CONFIRM_SECS:g}s "
+            f"(score feed total {tot}). Goal count set back. If a bet was placed, check it in SportyBet.", urgent=True)
+
+    def _remember_bets(self, slow: dict, results: list):
+        """Keeps the order id of every accepted bet (and its market) so that bet can be cashed out later."""
+        for r in results:
+            if not isinstance(r, dict) or r.get("bizCode") != 10000:
+                continue
+            sent = (r.get("_sent") or {}).get("selection") or {}
+            parts = str(sent.get("id", "")).split("/")
+            spec = str(sent.get("specifier") or "")
+            mg = re.search(r"goalnr=(\d+)", spec)
+            self._bets.append({"order_id": str((r.get("data") or {}).get("orderId") or ""),
+                               "event_id": slow["event_id"],
+                               "market_id": parts[-2] if len(parts) >= 2 else "",
+                               "specifier": spec,
+                               "goal_no": int(mg.group(1)) if mg else None,
+                               "bet_id": "", "stake": float(r.get("_stake") or 0)})
+
+    async def _refresh_balance_once(self):
+        v = await asyncio.get_running_loop().run_in_executor(self._bg_pool, self.sb.get_balance)
+        if v is not None and not self._processing:
+            self.balance = v
+
+    async def _balance_loop(self):
+        """Reads the real SportyBet balance in the background, so a bet never waits for it."""
+        try:
+            while self._slow:
+                if not self._processing:
+                    await self._refresh_balance_once()
+                await asyncio.sleep(Config.BALANCE_POLL)
+        except asyncio.CancelledError:
+            pass
+
+    async def _cashout_when_open(self, bets: List[dict]):
+        """Cashes out THESE bets (found by their order id), each only when the market it was placed on
+        is open again on SportyBet. Polls the SportyBet API until then (or CASHOUT_MAX_SECS)."""
+        loop = asyncio.get_running_loop()
+        total = len(bets)
+        end = time.time() + Config.CASHOUT_MAX_SECS
+        pending, claimed, done, why = list(bets), set(), 0, ""
+        try:
+            while pending and time.time() < end and self._slow:
+                await asyncio.sleep(Config.CASHOUT_POLL)
+                for b in list(pending):
+                    try:
+                        data = await asyncio.wait_for(
+                            loop.run_in_executor(self._bg_pool, self.sb.fetch_event, b["event_id"]),
+                            timeout=Config.API_TIMEOUT)
+                    except Exception:
+                        continue
+                    if not data or not self.sb.market_open(data, b):
+                        continue
+                    res = await loop.run_in_executor(self._bg_pool, self.sb.cashout_one, b, claimed)
+                    if res.get("ok"):
+                        pending.remove(b)
+                        done += 1
+                        if b in self._bets:
+                            self._bets.remove(b)
+                        await self.alerter.send(f"💰 cashed out bet {b.get('bet_id')} for ₦{res.get('amount', 0):,.2f}", urgent=True)
+                    else:
+                        why = res.get("why", "")
+        except asyncio.CancelledError:
+            pass
+        self._has_open_bet = bool(self._bets)
+        self._sync()
+        await self.alerter.send(
+            f"CASHOUT done={done}/{total}" + (f"\nnot cashed out: {html.escape(why)}" if pending else ""), urgent=True)
+        asyncio.create_task(self._refresh_balance_once())
+
+    async def _auto_clear(self):
+        """Full time: the locked game clears itself."""
+        await asyncio.sleep(2.0)
+        if self._slow:
+            await self.clear_slow()
+            await self.alerter.send("🏁 Full time - the locked game was cleared automatically. Send /slow for the next one.")
+
+    def _ft_guess(self, since: Optional[float], secs: float) -> bool:
+        """Full time without a clear FT answer: the last known match clock is 85+ min, the API has been silent (or has had
+        no open next-goal market) for `secs` seconds, and no bet is waiting to be cashed out."""
+        if since is None or time.time() - since < secs or self._bets:
+            return False
+        return self._clock is not None and self._clock[0] >= 85.0
+
+    async def _ft_clear(self, slow: dict, why: str, data: Any = None):
+        fields = _api_fields(data) if data else "no data"
+        _plog(f"FULL TIME assumed ({why}); API fields: {fields[:600]}")
+        await self.alerter.send(
+            f"⏸ <b>FULL TIME</b> (assumed: {html.escape(why)}) — {html.escape(slow['teams'] or '?')}\n"
+            f"Clearing this game automatically.\nAPI fields (send these to me so the exact full-time field can be added):\n"
+            f"<code>{html.escape(fields[:700])}</code>")
+        asyncio.ensure_future(self._auto_clear())
 
 
 # =====================================================================
@@ -3897,7 +4377,7 @@ def main():
         return
     pid = _read_pid()
     if _is_bot_pid(pid):
-        print(f"Already running (pid {pid}). Use:  python3 main.py stop   then start again.")
+        print(f"Already running (pid {pid}). Use:  python3 betbot.py stop   then start again.")
         return
     _first_run_setup()
     state = _terminal_login()
@@ -3920,7 +4400,7 @@ def main():
             PID_FILE.unlink(missing_ok=True)
         return
     print(f"Starting in the background. You can close this terminal now.\n"
-          f"Telegram will confirm.  Logs: {LOG_FILE}   Stop: python3 main.py stop", flush=True)
+          f"Telegram will confirm.  Logs: {LOG_FILE}   Stop: python3 betbot.py stop", flush=True)
     _daemonize()
     PID_FILE.write_text(str(os.getpid()))
     try:
